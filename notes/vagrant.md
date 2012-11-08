@@ -3,7 +3,7 @@ Vagrant provides any easy method to setup virtual development environments, for 
 
 The basic process is to create a "base" vm, and then "provision" it with the software packages and setup needed. There are several ways to do this, including Chef and Puppet, but these instructions utilise the existing FixMyStreet install script, in order to keep this in line with other developments on FMS. The supplied scripts will create you a Vagrant vm based on the server edition of Ubuntu 12.04 LTS that contains everything you need to work on FMS.
 
-1. [Install VirtualBox](http://www.virtualbox.org/wiki/Downloads) and [Vagrant](http://downloads.vagrantup.com/), create a folder somewhere that you'll be doing your work from and clone [popit](https://github.com/mysociety/popit) into it.
+1. [Install VirtualBox](http://www.virtualbox.org/wiki/Downloads) and [Vagrant](http://downloads.vagrantup.com/), create a folder somewhere that you'll be doing your work from and clone [fixmystreet](https://github.com/mysociety/fixmystreet) into it.
 
 2. From your newly cloned `fixmystreet` directory, run `cp conf/Vagrantfile.example ../Vagrantfile` to move the Vagrant config file to the right place.
 
