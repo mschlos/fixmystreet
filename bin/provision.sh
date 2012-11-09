@@ -12,6 +12,9 @@ sed "s/^MAPIT_URL: ''/MAPIT_URL: 'http:\/\/mapit.mysociety.org'/" -i /var/www/lo
 sed "s/^  - cobrand_one/  - fixmystreet/" -i /var/www/localhost/fixmystreet/conf/general.yml
 sed "s/^  - cobrand_two: 'hostname_substring2'/  - fixmystreet: 'localhost'/" -i /var/www/localhost/fixmystreet/conf/general.yml
 
+# Switch the url to make the tests pass
+sed "s/^BASE_URL: 'http:\/\/www.example.org'/BASE_URL: 'http:\/\/localhost'/" -i /var/www/localhost/fixmystreet/conf/general.yml
+
 # Generate Welsh and Norweigian locales so i8n tests pass
 locale-gen cy_GB.UTF-8
 locale-gen nb_NO.UTF-8
