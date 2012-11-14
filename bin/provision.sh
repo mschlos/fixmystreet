@@ -13,7 +13,9 @@ sed "s/^  - cobrand_one/  - fixmystreet/" -i /var/www/localhost/fixmystreet/conf
 sed "s/^  - cobrand_two: 'hostname_substring2'/  - fixmystreet: 'localhost'/" -i /var/www/localhost/fixmystreet/conf/general.yml
 
 # Switch the url to make the tests pass
-sed "s/^BASE_URL: 'http:\/\/www.example.org'/BASE_URL: 'http:\/\/localhost'/" -i /var/www/localhost/fixmystreet/conf/general.yml
+# Note that this assumes you'll be browsing the site on the HOST machine
+# not the guest (because the port is 8080 on your host, but 80 on the guest)
+sed "s/^BASE_URL: 'http:\/\/www.example.org'/BASE_URL: 'http:\/\/localhost:8080'/" -i /var/www/localhost/fixmystreet/conf/general.yml
 
 # Generate Welsh and Norweigian locales so i8n tests pass
 locale-gen cy_GB.UTF-8
