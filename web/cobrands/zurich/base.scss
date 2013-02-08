@@ -63,7 +63,23 @@
 }
 #front-howto #front_stats,
 #front-main #postcodeForm {
-    background-color: $mobile_header_blue;
+  background-color: $mobile_header_blue;
+}
+
+//  fix here:
+//  a percentage width on input#pc breaks iPhone landscape/portrait switching
+//  and the other changes make this fix pretty
+
+#front-main #postcodeForm div {
+  background: inherit;
+  border-color:transparent;
+  input#pc {
+    width: 14em;
+    background-color: #fff;
+  }
+  input#sub {
+    width: 3em;
+  }
 }
 
 // No grey background or other bits
