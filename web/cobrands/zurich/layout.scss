@@ -117,7 +117,7 @@ body.mappage {
   #postcodeForm div {
     border-color: $dark_blue;
     input#pc {
-      width: 86%; // on widescreen, override the fixed width
+      max-width: none;
     }
   }
 }
