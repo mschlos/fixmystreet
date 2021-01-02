@@ -8,7 +8,11 @@ use strict;
 use warnings;
 
 use base 'DBIx::Class::Core';
-__PACKAGE__->load_components("FilterColumn", "InflateColumn::DateTime", "EncodedColumn");
+__PACKAGE__->load_components(
+  "FilterColumn",
+  "FixMyStreet::InflateColumn::DateTime",
+  "FixMyStreet::EncodedColumn",
+);
 __PACKAGE__->table("problem");
 __PACKAGE__->add_columns(
   "id",
@@ -25,6 +29,8 @@ __PACKAGE__->add_columns(
   "longitude",
   { data_type => "double precision", is_nullable => 0 },
   "bodies_str",
+  { data_type => "text", is_nullable => 1 },
+  "bodies_missing",
   { data_type => "text", is_nullable => 1 },
   "areas",
   { data_type => "text", is_nullable => 0 },
@@ -53,8 +59,9 @@ __PACKAGE__->add_columns(
   "created",
   {
     data_type     => "timestamp",
-    default_value => \"ms_current_timestamp()",
+    default_value => \"current_timestamp",
     is_nullable   => 0,
+    original      => { default_value => \"now()" },
   },
   "confirmed",
   { data_type => "timestamp", is_nullable => 1 },
@@ -71,8 +78,9 @@ __PACKAGE__->add_columns(
   "lastupdate",
   {
     data_type     => "timestamp",
-    default_value => \"ms_current_timestamp()",
+    default_value => \"current_timestamp",
     is_nullable   => 0,
+    original      => { default_value => \"now()" },
   },
   "whensent",
   { data_type => "timestamp", is_nullable => 1 },
@@ -84,6 +92,8 @@ __PACKAGE__->add_columns(
   { data_type => "boolean", default_value => \"false", is_nullable => 0 },
   "geocode",
   { data_type => "bytea", is_nullable => 1 },
+  "response_priority_id",
+  { data_type => "integer", is_foreign_key => 1, is_nullable => 1 },
   "send_fail_count",
   { data_type => "integer", default_value => 0, is_nullable => 0 },
   "send_fail_reason",
@@ -102,11 +112,30 @@ __PACKAGE__->add_columns(
   { data_type => "integer", default_value => 0, is_nullable => 1 },
   "subcategory",
   { data_type => "text", is_nullable => 1 },
+  "defect_type_id",
+  { data_type => "integer", is_foreign_key => 1, is_nullable => 1 },
 );
 __PACKAGE__->set_primary_key("id");
 __PACKAGE__->has_many(
   "comments",
   "FixMyStreet::DB::Result::Comment",
+  { "foreign.problem_id" => "self.id" },
+  { cascade_copy => 0, cascade_delete => 0 },
+);
+__PACKAGE__->belongs_to(
+  "defect_type",
+  "FixMyStreet::DB::Result::DefectType",
+  { id => "defect_type_id" },
+  {
+    is_deferrable => 0,
+    join_type     => "LEFT",
+    on_delete     => "NO ACTION",
+    on_update     => "NO ACTION",
+  },
+);
+__PACKAGE__->has_many(
+  "moderation_original_datas",
+  "FixMyStreet::DB::Result::ModerationOriginalData",
   { "foreign.problem_id" => "self.id" },
   { cascade_copy => 0, cascade_delete => 0 },
 );
@@ -117,15 +146,32 @@ __PACKAGE__->has_many(
   { cascade_copy => 0, cascade_delete => 0 },
 );
 __PACKAGE__->belongs_to(
+  "response_priority",
+  "FixMyStreet::DB::Result::ResponsePriority",
+  { id => "response_priority_id" },
+  {
+    is_deferrable => 0,
+    join_type     => "LEFT",
+    on_delete     => "NO ACTION",
+    on_update     => "NO ACTION",
+  },
+);
+__PACKAGE__->belongs_to(
   "user",
   "FixMyStreet::DB::Result::User",
   { id => "user_id" },
-  { is_deferrable => 1, on_delete => "CASCADE", on_update => "CASCADE" },
+  { is_deferrable => 0, on_delete => "NO ACTION", on_update => "NO ACTION" },
+);
+__PACKAGE__->has_many(
+  "user_planned_reports",
+  "FixMyStreet::DB::Result::UserPlannedReport",
+  { "foreign.report_id" => "self.id" },
+  { cascade_copy => 0, cascade_delete => 0 },
 );
 
 
-# Created by DBIx::Class::Schema::Loader v0.07017 @ 2012-12-13 15:13:48
-# DO NOT MODIFY THIS OR ANYTHING ABOVE! md5sum:H2P3Og37G569nQdQA1IWaA
+# Created by DBIx::Class::Schema::Loader v0.07035 @ 2019-04-25 12:06:39
+# DO NOT MODIFY THIS OR ANYTHING ABOVE! md5sum:hUXle+TtlkDkxkBrVa/u+g
 
 # Add fake relationship to stored procedure table
 __PACKAGE__->has_one(
@@ -135,56 +181,65 @@ __PACKAGE__->has_one(
   { cascade_copy => 0, cascade_delete => 0 },
 );
 
-__PACKAGE__->filter_column(
-    extra => {
-        filter_from_storage => sub {
-            my $self = shift;
-            my $ser  = shift;
-            return undef unless defined $ser;
-            utf8::encode($ser) if utf8::is_utf8($ser);
-            my $h = new IO::String($ser);
-            return RABX::wire_rd($h);
-        },
-        filter_to_storage => sub {
-            my $self = shift;
-            my $data = shift;
-            my $ser  = '';
-            my $h    = new IO::String($ser);
-            RABX::wire_wr( $data, $h );
-            return $ser;
-        },
-    }
+# This will return the oldest moderation_original_data, if any.
+# The plural can be used to return all entries.
+__PACKAGE__->might_have(
+  "moderation_original_data",
+  "FixMyStreet::DB::Result::ModerationOriginalData",
+  { "foreign.problem_id" => "self.id" },
+  { where => { 'comment_id' => undef },
+    order_by => 'id',
+    rows => 1,
+    cascade_copy => 0, cascade_delete => 1 },
 );
 
-__PACKAGE__->filter_column(
-    geocode => {
-        filter_from_storage => sub {
-            my $self = shift;
-            my $ser  = shift;
-            return undef unless defined $ser;
-            utf8::encode($ser) if utf8::is_utf8($ser);
-            my $h = new IO::String($ser);
-            return RABX::wire_rd($h);
-        },
-        filter_to_storage => sub {
-            my $self = shift;
-            my $data = shift;
-            my $ser  = '';
-            my $h    = new IO::String($ser);
-            RABX::wire_wr( $data, $h );
-            return $ser;
-        },
-    }
+# Add a possible join for the Contact object associated with
+# this report (based on bodies_str and category). If the report
+# was sent to multiple bodies, only returns the first.
+__PACKAGE__->belongs_to(
+  contact => "FixMyStreet::DB::Result::Contact",
+  sub {
+    my $args = shift;
+    return {
+        "$args->{foreign_alias}.category" => { -ident => "$args->{self_alias}.category" },
+        -and => [
+            \[ "CAST($args->{foreign_alias}.body_id AS text) = (regexp_split_to_array($args->{self_alias}.bodies_str, ','))[1]" ],
+        ]
+    };
+  },
+  {
+    join_type => "LEFT",
+    on_delete => "NO ACTION",
+    on_update => "NO ACTION",
+  },
 );
 
-use DateTime::TimeZone;
-use Image::Size;
-use Moose;
+__PACKAGE__->load_components("+FixMyStreet::DB::RABXColumn");
+__PACKAGE__->rabx_column('extra');
+__PACKAGE__->rabx_column('geocode');
+
+use Moo;
 use namespace::clean -except => [ 'meta' ];
 use Utils;
+use FixMyStreet::Map::FMS;
+use FixMyStreet::Template;
+use FixMyStreet::Template::SafeString;
+use LWP::Simple qw($ua);
 use RABX;
+use URI;
+use URI::QueryParam;
 
-with 'FixMyStreet::Roles::Abuser';
+my $IM = eval {
+    require Image::Magick;
+    Image::Magick->import;
+    1;
+};
+
+with 'FixMyStreet::Roles::Abuser',
+     'FixMyStreet::Roles::Extra',
+     'FixMyStreet::Roles::Moderation',
+     'FixMyStreet::Roles::Translatable',
+     'FixMyStreet::Roles::PhotoSet';
 
 =head2
 
@@ -197,15 +252,8 @@ HASHREF.
 =cut
 
 sub open_states {
-    my $states = {
-        'confirmed'        => 1,
-        'investigating'    => 1,
-        'in progress'      => 1,
-        'planned'          => 1,
-        'action scheduled' => 1,
-    };
-
-    return wantarray ? keys %{$states} : $states;
+    my @states = map { $_->label } @{FixMyStreet::DB->resultset("State")->open};
+    return wantarray ? @states : { map { $_ => 1 } @states };
 }
 
 =head2
@@ -219,13 +267,9 @@ HASHREF.
 =cut
 
 sub fixed_states {
-    my $states = {
-        'fixed'           => 1,
-        'fixed - user'    => 1,
-        'fixed - council' => 1,
-    };
-
-    return wantarray ? keys %{ $states } : $states;
+    my @states = map { $_->label } @{FixMyStreet::DB->resultset("State")->fixed};
+    push @states, 'fixed - user', 'fixed - council' if @states;
+    return wantarray ? @states : { map { $_ => 1 } @states };
 }
 
 =head2
@@ -239,48 +283,8 @@ HASHREF.
 =cut
 
 sub closed_states {
-    my $states = {
-        'closed'                      => 1,
-        'unable to fix'               => 1,
-        'not responsible'             => 1,
-        'duplicate'                   => 1,
-        'internal referral'           => 1,
-    };
-
-    return wantarray ? keys %{$states} : $states;
-}
-
-
-=head2
-
-    @states = FixMyStreet::DB::Problem::visible_states();
-
-Get a list of states that should be visible on the site. If called in
-array context then returns an array of names, otherwise returns a
-HASHREF.
-
-=cut
-
-my $visible_states = {
-    'confirmed'                   => 1,
-    'investigating'               => 1,
-    'in progress'                 => 1,
-    'planned'                     => 1,
-    'action scheduled'            => 1,
-    'fixed'                       => 1,
-    'fixed - council'             => 1,
-    'fixed - user'                => 1,
-    'unable to fix'               => 1,
-    'not responsible'             => 1,
-    'duplicate'                   => 1,
-    'closed'                      => 1,
-    'internal referral'           => 1,
-};
-sub visible_states {
-    return wantarray ? keys %{$visible_states} : $visible_states;
-}
-sub visible_states_add_unconfirmed {
-    $visible_states->{unconfirmed} = 1;
+    my @states = map { $_->label } @{FixMyStreet::DB->resultset("State")->closed};
+    return wantarray ? @states : { map { $_ => 1 } @states };
 }
 
 =head2
@@ -298,92 +302,66 @@ sub all_states {
         'hidden'                      => 1,
         'partial'                     => 1,
         'unconfirmed'                 => 1,
-        'confirmed'                   => 1,
-        'investigating'               => 1,
-        'in progress'                 => 1,
-        'action scheduled'            => 1,
-        'fixed'                       => 1,
         'fixed - council'             => 1,
         'fixed - user'                => 1,
-        'unable to fix'               => 1,
-        'not responsible'             => 1,
-        'duplicate'                   => 1,
-        'closed'                      => 1,
-        'internal referral'           => 1,
     };
-
+    map { $states->{$_->label} = 1 } @{FixMyStreet::DB->resultset("State")->states};
     return wantarray ? keys %{$states} : $states;
 }
 
 =head2
 
-    @states = FixMyStreet::DB::Problem::council_states();
+    @visible_states = FixMyStreet::DB::Problem::visible_states();
+    @hidden_states  = FixMyStreet::DB::Problem::hidden_states();
 
-Get a list of states that are availble to council users. If called in
-array context then returns an array of names, otherwise returns a
-HASHREF.
+Get a list of states that should be visible (or hidden) on the site. If called
+in array context then returns an array of names, otherwise returns a HASHREF.
 
 =cut
-sub council_states {
-    my $states = {
-        'confirmed'                   => 1,
-        'investigating'               => 1,
-        'action scheduled'            => 1,
-        'in progress'                 => 1,
-        'fixed - council'             => 1,
-        'unable to fix'               => 1,
-        'not responsible'             => 1,
-        'duplicate'                   => 1,
-        'internal referral'           => 1,
-    };
 
-    return wantarray ? keys %{$states} : $states;
+my $hidden_states = {
+    'hidden' => 1,
+    'partial' => 1,
+    'unconfirmed' => 1,
+};
+
+sub hidden_states {
+    return wantarray ? keys %{$hidden_states} : $hidden_states;
 }
 
-my $tz = DateTime::TimeZone->new( name => "local" );
-
-sub confirmed_local {
-    my $self = shift;
-
-    return $self->confirmed
-      ? $self->confirmed->set_time_zone($tz)
-      : $self->confirmed;
+sub visible_states {
+    my %visible_states = map {
+        $hidden_states->{$_} ? () : ($_ => 1)
+    } all_states();
+    return wantarray ? keys %visible_states : \%visible_states;
 }
 
-sub created_local {
-    my $self = shift;
-
-    return $self->created
-      ? $self->created->set_time_zone($tz)
-      : $self->created;
+sub visible_states_add {
+    my ($self, @states) = @_;
+    for my $state (@states) {
+        delete $hidden_states->{$state};
+    }
 }
 
-sub whensent_local {
-    my $self = shift;
-
-    return $self->whensent
-      ? $self->whensent->set_time_zone($tz)
-      : $self->whensent;
-}
-
-sub lastupdate_local {
-    my $self = shift;
-
-    return $self->lastupdate
-      ? $self->lastupdate->set_time_zone($tz)
-      : $self->lastupdate;
+sub visible_states_remove {
+    my ($self, @states) = @_;
+    for my $state (@states) {
+        $hidden_states->{$state} = 1;
+    }
 }
 
 around service => sub {
     my ( $orig, $self ) = ( shift, shift );
-    my $s = $self->$orig(@_);
+    # service might be undef if e.g. unsaved code report
+    my $s = $self->$orig(@_) || "";
     $s =~ s/_/ /g;
     return $s;
 };
 
 sub title_safe {
     my $self = shift;
-    return _('Awaiting moderation') if $self->cobrand eq 'zurich' && $self->state eq 'unconfirmed';
+    return _('Awaiting moderation') if $self->cobrand eq 'zurich' && $self->state eq 'submitted';
+    return sprintf("%s problem", $self->category) if $self->cobrand eq 'tfl' && $self->result_source->schema->cobrand->moniker ne 'tfl';
     return $self->title;
 }
 
@@ -408,41 +386,18 @@ sub check_for_errors {
     $errors{title} = _('Please enter a subject')
       unless $self->title =~ m/\S/;
 
+    $errors{title} = _('Please make sure you are not including an email address')
+        if mySociety::EmailUtil::is_valid_email($self->title);
+
     $errors{detail} = _('Please enter some details')
       unless $self->detail =~ m/\S/;
 
     $errors{bodies} = _('No council selected')
       unless $self->bodies_str
-          && $self->bodies_str =~ m/^(?:-1|[\d,]+(?:\|[\d,]+)?)$/;
+          && $self->bodies_str =~ m/^(?:-1|[\d,]+)$/;
 
     if ( !$self->name || $self->name !~ m/\S/ ) {
         $errors{name} = _('Please enter your name');
-    }
-    elsif (length( $self->name ) < 5
-        || $self->name !~ m/\s/
-        || $self->name =~ m/\ba\s*n+on+((y|o)mo?u?s)?(ly)?\b/i )
-    {
-        $errors{name} = _(
-'Please enter your full name, councils need this information – if you do not wish your name to be shown on the site, untick the box below'
-        );
-    }
-
-    if (   $self->category
-        && $self->category eq _('-- Pick a category --') )
-    {
-        $errors{category} = _('Please choose a category');
-        $self->category(undef);
-    }
-    elsif ($self->category
-        && $self->category eq _('-- Pick a property type --') )
-    {
-        $errors{category} = _('Please choose a property type');
-        $self->category(undef);
-    }
-
-    if ( $self->bodies_str && $self->detail &&
-        $self->bodies_str eq '2482' && length($self->detail) > 2000 ) {
-        $errors{detail} = _('Reports are limited to 2000 characters in length. Please shorten your report');
     }
 
     return \%errors;
@@ -467,30 +422,60 @@ sub confirm {
     return if $self->state eq 'confirmed';
 
     $self->state('confirmed');
-    $self->confirmed( \'ms_current_timestamp()' );
+    $self->confirmed( \'current_timestamp' );
     return 1;
+}
+
+sub category_display {
+    my $self = shift;
+    my $contact = $self->contact;
+    return $self->category unless $contact; # Fallback; shouldn't happen, but some tests
+    return $contact->category_display;
 }
 
 sub bodies_str_ids {
     my $self = shift;
-    return unless $self->bodies_str;
-    (my $bodies = $self->bodies_str) =~ s/\|.*$//;
-    my @bodies = split( /,/, $bodies );
+    return [] unless $self->bodies_str;
+    my @bodies = split( /,/, $self->bodies_str );
     return \@bodies;
 }
 
 =head2 bodies
 
-Returns an arrayref of bodies to which a report was sent.
+Returns a hashref of bodies to which a report was sent.
 
 =cut
 
-sub bodies($) {
+has bodies => (
+    is => 'ro',
+    lazy => 1,
+    default => sub {
+        my $self = shift;
+        return {} unless $self->bodies_str;
+        my $cache = $self->result_source->schema->cache;
+        return $cache->{bodies}{$self->bodies_str} if $cache->{bodies}{$self->bodies_str};
+
+        my $bodies = $self->bodies_str_ids;
+        my @bodies = $self->result_source->schema->resultset('Body')->search(
+            { id => $bodies },
+            { prefetch => 'body_areas' },
+        )->all;
+        $cache->{bodies}{$self->bodies_str} = { map { $_->id => $_ } @bodies };
+        return $cache->{bodies}{$self->bodies_str};
+    },
+);
+
+sub body_names($) {
     my $self = shift;
-    return {} unless $self->bodies_str;
-    my $bodies = $self->bodies_str_ids;
-    my @bodies = FixMyStreet::App->model('DB::Body')->search({ id => $bodies })->all;
-    return { map { $_->id => $_ } @bodies };
+    my $bodies = $self->bodies;
+    my @names = map { $_->name } values %$bodies;
+    return \@names;
+}
+
+sub to_body_named($$) {
+    my ($self, $re) = @_;
+    my $names = join(',,', @{$self->body_names});
+    $names =~ /$re/;
 }
 
 =head2 url
@@ -504,15 +489,79 @@ sub url {
     return "/report/" . $self->id;
 }
 
-=head2 get_photo_params
+sub admin_url {
+    my ($self, $cobrand) = @_;
+    return $cobrand->admin_base_url . '/report_edit/' . $self->id;
+}
 
-Returns a hashref of details of any attached photo for use in templates.
+=head2 tokenised_url
+
+Return a url for this problem report that logs a user in
 
 =cut
 
-sub get_photo_params {
+sub tokenised_url {
+    my ($self, $user, $params) = @_;
+
+    my %params;
+    if ($user->email_verified) {
+        $params{email} = $user->email;
+    } elsif ($user->phone_verified) {
+        $params{phone} = $user->phone;
+        # This is so the email token can look up/ log in a phone user
+        $params{login_type} = 'phone';
+    }
+
+    my $token = FixMyStreet::App->model('DB::Token')->create(
+        {
+            scope => 'email_sign_in',
+            data  => {
+                %params,
+                id    => $self->id,
+                r     => $self->url,
+                p     => $params,
+            }
+        }
+    );
+
+    return "/M/". $token->token;
+}
+
+has view_token => (
+    is => 'ro',
+    lazy => 1,
+    default => sub {
+        my $self = shift;
+        my $token = FixMyStreet::DB->resultset('Token')->create({
+            scope => 'alert_to_reporter',
+            data => { id => $self->id }
+        });
+    },
+);
+
+=head2 view_url
+
+Return a url for this problem report that will always show it
+(even if e.g. a private report) but does not log the user in.
+
+=cut
+
+sub view_url {
     my $self = shift;
-    return FixMyStreet::App::get_photo_params($self, 'id');
+    return $self->url unless $self->non_public;
+    return "/R/" . $self->view_token->token;
+}
+
+=head2 is_hidden
+
+Returns 1 if the problem is in an hidden state otherwise 0.
+
+=cut
+
+sub is_hidden {
+    my $self = shift;
+
+    return exists $self->hidden_states->{ $self->state } ? 1 : 0;
 }
 
 =head2 is_open
@@ -527,6 +576,16 @@ sub is_open {
     return exists $self->open_states->{ $self->state } ? 1 : 0;
 }
 
+=head2 is_in_progress
+
+Sees if the problem is in an open, not 'confirmed' state.
+
+=cut
+
+sub is_in_progress {
+    my $self = shift;
+    return $self->is_open && $self->state ne 'confirmed' ? 1 : 0;
+}
 
 =head2 is_fixed
 
@@ -572,235 +631,217 @@ meta data about the report.
 =cut
 
 sub meta_line {
-    my ( $problem, $c ) = @_;
+    my ( $problem, $user ) = @_;
+    my $cobrand = $problem->result_source->schema->cobrand;
 
-    my $date_time = Utils::prettify_dt( $problem->confirmed_local );
+    my $date_time = Utils::prettify_dt( $problem->confirmed );
     my $meta = '';
 
-    # FIXME Should be in cobrand
-    if ($c->cobrand->moniker eq 'emptyhomes') {
+    my $category = $problem->category_display;
+    $category = $cobrand->call_hook(change_category_text => $category) || $category;
 
-        my $category = _($problem->category);
-        utf8::decode($category);
-        $meta = sprintf(_('%s, reported at %s'), $category, $date_time);
-
+    if ( $problem->anonymous ) {
+        if ( $problem->service and $category && $category ne _('Other') ) {
+            $meta =
+            sprintf( _('Reported via %s in the %s category anonymously at %s'),
+                $problem->service, $category, $date_time );
+        } elsif ( $problem->service ) {
+            $meta = sprintf( _('Reported via %s anonymously at %s'),
+                $problem->service, $date_time );
+        } elsif ( $category and $category ne _('Other') ) {
+            $meta = sprintf( _('Reported in the %s category anonymously at %s'),
+                $category, $date_time );
+        } else {
+            $meta = sprintf( _('Reported anonymously at %s'), $date_time );
+        }
     } else {
+        my $problem_name = $problem->name;
 
-        if ( $problem->anonymous ) {
-            if (    $problem->service
-                and $problem->category && $problem->category ne _('Other') )
-            {
-                $meta =
-                sprintf( _('Reported by %s in the %s category anonymously at %s'),
-                    $problem->service, $problem->category, $date_time );
-            }
-            elsif ( $problem->service ) {
-                $meta = sprintf( _('Reported by %s anonymously at %s'),
-                    $problem->service, $date_time );
-            }
-            elsif ( $problem->category and $problem->category ne _('Other') ) {
-                $meta = sprintf( _('Reported in the %s category anonymously at %s'),
-                    $problem->category, $date_time );
-            }
-            else {
-                $meta = sprintf( _('Reported anonymously at %s'), $date_time );
-            }
-        }
-        else {
-            if (    $problem->service
-                and $problem->category && $problem->category ne _('Other') )
-            {
-                $meta = sprintf(
-                    _('Reported by %s in the %s category by %s at %s'),
-                    $problem->service, $problem->category,
-                    $problem->name,    $date_time
-                );
-            }
-            elsif ( $problem->service ) {
-                $meta = sprintf( _('Reported by %s by %s at %s'),
-                    $problem->service, $problem->name, $date_time );
-            }
-            elsif ( $problem->category and $problem->category ne _('Other') ) {
-                $meta = sprintf( _('Reported in the %s category by %s at %s'),
-                    $problem->category, $problem->name, $date_time );
-            }
-            else {
-                $meta =
-                sprintf( _('Reported by %s at %s'), $problem->name, $date_time );
-            }
+        if ($user and
+            $user->has_permission_to('view_body_contribute_details', $problem->bodies_str_ids) and
+            $problem->name ne $problem->user->name) {
+            $problem_name = sprintf('%s (%s)', $problem->name, $problem->user->name );
         }
 
+        if ( $problem->service and $category && $category ne _('Other') ) {
+            $meta = sprintf(
+                _('Reported via %s in the %s category by %s at %s'),
+                $problem->service, $category,
+                $problem_name,    $date_time
+            );
+        } elsif ( $problem->service ) {
+            $meta = sprintf( _('Reported via %s by %s at %s'),
+                $problem->service, $problem_name, $date_time );
+        } elsif ( $category and $category ne _('Other') ) {
+            $meta = sprintf( _('Reported in the %s category by %s at %s'),
+                $category, $problem_name, $date_time );
+        } else {
+            $meta = sprintf( _('Reported by %s at %s'), $problem_name, $date_time );
+        }
     }
 
     return $meta;
 }
 
+sub nearest_address {
+    my $self = shift;
+
+    return '' unless $self->geocode;
+
+    my $address = $self->geocode->{resourceSets}[0]{resources}[0];
+    return $address->{name};
+}
+
 sub body {
-    my ( $problem, $c ) = @_;
+    my ( $problem, $link ) = @_;
     my $body;
     if ($problem->external_body) {
         if ($problem->cobrand eq 'zurich') {
-            $body = $c->model('DB::Body')->find({ id => $problem->external_body });
+            my $cache = $problem->result_source->schema->cache;
+            return $cache->{bodies}{$problem->external_body} //= FixMyStreet::DB->resultset('Body')->find({ id => $problem->external_body });
         } else {
-            $body = $problem->external_body;
+            $body = FixMyStreet::Template::html_filter($problem->external_body);
         }
     } else {
         my $bodies = $problem->bodies;
-        $body = join( _(' and '),
-            map {
-                my $name = $_->name;
-                if (mySociety::Config::get('AREA_LINKS_FROM_PROBLEMS')) {
-                    '<a href="' . $_->url($c) . '">' . $name . '</a>';
-                } else {
-                    $name;
-                }
-            } values %$bodies
-        );
+        my @body_names = sort map {
+            my $name = $_->name;
+            if ($link and FixMyStreet->config('AREA_LINKS_FROM_PROBLEMS')) {
+                '<a href="' . $_->url . '">' . FixMyStreet::Template::html_filter($name) . '</a>';
+            } else {
+                FixMyStreet::Template::html_filter($name);
+            }
+        } values %$bodies;
+        if ( scalar @body_names > 2 ) {
+            $body = join( ', ', splice @body_names, 0, -1);
+            $body = join( ',' . _(' and '), ($body, $body_names[-1]));
+        } else {
+            $body = join( _(' and '), @body_names);
+        }
     }
-    return $body;
+    return FixMyStreet::Template::SafeString->new($body);
+}
+
+
+=head2 time_ago
+  Returns how long ago a problem was reported in an appropriately
+  prettified duration, depending on the duration.
+=cut
+
+sub time_ago {
+    my ( $self, $date ) = @_;
+    $date ||= 'confirmed';
+    my $duration = time() - $self->$date->epoch;
+
+    return Utils::prettify_duration( $duration );
+}
+
+=head2 days_ago
+
+  Returns how many days ago a problem was reported.
+
+=cut
+
+sub days_ago {
+    my ( $self, $date ) = @_;
+    $date ||= 'confirmed';
+    my $now = DateTime->now( time_zone => FixMyStreet->time_zone || FixMyStreet->local_time_zone );
+    my $duration = $now->delta_days($self->$date);
+    return $duration->delta_days;
+}
+
+=head2 response_templates
+
+Returns all ResponseTemplates attached to this problem's bodies, in alphabetical
+order of title.
+
+=cut
+
+sub response_templates {
+    my $self = shift;
+    return $self->result_source->schema->resultset('ResponseTemplate')->search(
+        {
+            'me.body_id' => $self->bodies_str_ids,
+            'contact.category' => [ $self->category, undef ],
+        },
+        {
+            order_by => 'title',
+            join => { 'contact_response_templates' => 'contact' },
+        }
+    );
+}
+
+=head2 response_priorities
+
+Returns all ResponsePriorities attached to this problem's category/contact, in
+alphabetical order of name.
+
+=cut
+
+sub response_priorities {
+    my $self = shift;
+    my $rs = $self->result_source->schema->resultset('ResponsePriority')->for_bodies($self->bodies_str_ids, $self->category);
+    $rs->search([
+        'me.deleted' => 0,
+        'me.id' => $self->response_priority_id,
+    ]);
+}
+
+=head2 defect_types
+
+Returns all DefectTypes attached to this problem's category/contact, in
+alphabetical order of name.
+
+=cut
+
+sub defect_types {
+    my $self = shift;
+    return $self->result_source->schema->resultset('DefectType')->for_bodies($self->bodies_str_ids, $self->category);
 }
 
 # returns true if the external id is the council's ref, i.e., useful to publish it
-# (by way of an example, the barnet send method returns a useful reference when
+# (by way of an example, the Oxfordshire send method returns a useful reference when
 # it succeeds, so that is the ref we should show on the problem report page).
 #     Future: this is installation-dependent so maybe should be using the contact
 #             data to determine if the external id is public on a council-by-council basis.
 #     Note:   this only makes sense when called on a problem that has been sent!
 sub can_display_external_id {
     my $self = shift;
-    if ($self->external_id && $self->send_method_used && 
-        ($self->send_method_used eq 'barnet' || $self->bodies_str =~ /2237/)) {
+    if ($self->external_id && $self->to_body_named('Oxfordshire|Lincolnshire|Isle of Wight|East Sussex|Central Bedfordshire')) {
         return 1;
     }
-    return 0;    
+    return 0;
 }
 
-# TODO Some/much of this could be moved to the template
-
-# either: 
-#   "sent to council 3 mins later"
-#   "[Council name] ref: XYZ"
-# or
-#   "sent to council 3 mins later, their ref: XYZ"
-#
-# Note: some silliness with pronouns and the adjacent comma mean this is
-#       being presented as a single string rather than two
-sub processed_summary_string {
-    my ( $problem, $c ) = @_;
-    my ($duration_clause, $external_ref_clause);
-    if ($problem->whensent) {
-        $duration_clause = $problem->duration_string($c);
-    }
-    if ($problem->can_display_external_id) {
-        if ($duration_clause) {
-            $external_ref_clause = sprintf(_('council ref:&nbsp;%s'), $problem->external_id);
-        } else {
-            $external_ref_clause = sprintf(_('%s ref:&nbsp;%s'), $problem->external_body, $problem->external_id);
-        }
-    }
-    if ($duration_clause and $external_ref_clause) {
-        return "$duration_clause, $external_ref_clause"
-    } else { 
-        return $duration_clause || $external_ref_clause
-    }
-}
-
+# This can return HTML and is safe, so returns a FixMyStreet::Template::SafeString
 sub duration_string {
-    my ( $problem, $c ) = @_;
-    my $body = $problem->body( $c );
-    return sprintf(_('Sent to %s %s later'), $body,
-        Utils::prettify_duration($problem->whensent_local->epoch - $problem->confirmed_local->epoch, 'minute')
+    my $problem = shift;
+    my $cobrand = $problem->result_source->schema->cobrand;
+    my $body = $cobrand->call_hook(link_to_council_cobrand => $problem) || $problem->body(1);
+    my $handler = $cobrand->call_hook(get_body_handler_for_problem => $problem);
+    if ( $handler && $handler->call_hook('is_council_with_case_management') ) {
+        my $s = sprintf(_('Received by %s moments later'), $body);
+        return FixMyStreet::Template::SafeString->new($s);
+    }
+    return unless $problem->whensent;
+    my $s = sprintf(_('Sent to %s %s later'), $body,
+        Utils::prettify_duration($problem->whensent->epoch - $problem->confirmed->epoch, 'minute')
     );
+    return FixMyStreet::Template::SafeString->new($s);
 }
 
 sub local_coords {
     my $self = shift;
-    if ($self->cobrand eq 'zurich') {
-        my ($x, $y) = Geo::Coordinates::CH1903::from_latlon($self->latitude, $self->longitude);
+    my $cobrand = $self->get_cobrand_logged;
+    if ($cobrand->moniker eq 'zurich') {
+        my ($x, $y) = Geo::Coordinates::CH1903Plus::from_latlon($self->latitude, $self->longitude);
         return ( int($x+0.5), int($y+0.5) );
+    } elsif ($cobrand->country eq 'GB') {
+        my $coordsyst = 'G';
+        $coordsyst = 'I' if FixMyStreet::Map::FMS::in_northern_ireland_box($self->latitude, $self->longitude);
+        my ($x, $y) = Utils::convert_latlon_to_en( $self->latitude, $self->longitude, $coordsyst );
+        return ($x, $y, $coordsyst);
     }
-}
-
-=head2 update_from_open311_service_request
-
-    $p->update_from_open311_service_request( $request, $council_details, $system_user );
-
-Updates the problem based on information in the passed in open311 request. If the request
-has an older update time than the problem's lastupdate time then nothing happens.
-
-Otherwise a comment will be created if there is status update text in the open311 request.
-If the open311 request has a state of closed then the problem will be marked as fixed.
-
-NB: a comment will always be created if the problem is being marked as fixed.
-
-Fixed problems will not be re-opened by this method.
-
-=cut
-
-sub update_from_open311_service_request {
-    my ( $self, $request, $council_details, $system_user ) = @_;
-
-    my ( $updated, $status_notes );
-
-    if ( ! ref $request->{updated_datetime} ) {
-        $updated = $request->{updated_datetime};
-    }
-
-    if ( ! ref $request->{status_notes} ) {
-        $status_notes = $request->{status_notes};
-    }
-
-    my $update = FixMyStreet::App->model('DB::Comment')->new(
-        {
-            problem_id => $self->id,
-            state      => 'confirmed',
-            created    => $updated || \'ms_current_timestamp()',
-            confirmed => \'ms_current_timestamp()',
-            text      => $status_notes,
-            mark_open => 0,
-            mark_fixed => 0,
-            user => $system_user,
-            anonymous => 0,
-            name => $council_details->{name},
-        }
-    );
-
-
-    my $w3c = DateTime::Format::W3CDTF->new;
-    my $req_time = $w3c->parse_datetime( $request->{updated_datetime} );
-
-    # set a timezone here as the $req_time will have one and if we don't
-    # use a timezone then the date comparisons are invalid.
-    # of course if local timezone is not the one that went into the data
-    # base then we're also in trouble
-    my $lastupdate = $self->lastupdate;
-    $lastupdate->set_time_zone( DateTime::TimeZone->new( name => 'local' ) );
-
-    # update from open311 is older so skip
-    if ( $req_time < $lastupdate ) {
-        return 0;
-    }
-
-    if ( $request->{status} eq 'closed' ) {
-        if ( $self->state ne 'fixed' ) {
-            $self->state('fixed');
-            $update->mark_fixed(1);
-
-            if ( !$status_notes ) {
-                # FIXME - better text here
-                $status_notes = _('Closed by council');
-            }
-        }
-    }
-
-    if ( $status_notes ) {
-        $update->text( $status_notes );
-        $self->lastupdate( $req_time );
-        $self->update;
-        $update->insert;
-    }
-
-    return 1;
 }
 
 sub update_send_failed {
@@ -809,16 +850,64 @@ sub update_send_failed {
 
     $self->update( {
         send_fail_count => $self->send_fail_count + 1,
-        send_fail_timestamp => \'ms_current_timestamp()',
+        send_fail_timestamp => \'current_timestamp',
         send_fail_reason => $msg
     } );
 }
 
-sub as_hashref {
-    my $self = shift;
-    my $c    = shift;
+=head2 updates_sent_to_body
 
-    return {
+Returns 1 if updates left on this report will be sent to any of the receiving
+bodies by some mechanism. Right now that mechanism is Open311.
+
+=cut
+
+sub updates_sent_to_body {
+    my $self = shift;
+
+    return 1 if $self->to_body_named('TfL');
+    return unless $self->send_method_used && $self->send_method_used =~ /Open311/;
+
+    # Some bodies only send updates *to* FMS, they don't receive updates.
+    my $cobrand = $self->get_cobrand_logged;
+    my $handler = $cobrand->call_hook(get_body_handler_for_problem => $self);
+    return 0 if $handler && $handler->call_hook('open311_post_update_skip');
+
+    my @bodies = values %{ $self->bodies };
+    my @updates_sent = grep {
+        $_->send_comments &&
+        (
+            $_->send_method eq 'Open311' ||
+            $_->send_method eq 'Noop' # Sending might be temporarily disabled
+        )
+    } @bodies;
+    return scalar @updates_sent;
+}
+
+sub add_send_method {
+    my $self = shift;
+    my $sender = shift;
+    ($sender = ref $sender) =~ s/^.*:://;
+    if (my $send_method = $self->send_method_used) {
+        $self->send_method_used("$send_method,$sender");
+    } else {
+        $self->send_method_used($sender);
+    }
+}
+
+sub resend {
+    my $self = shift;
+    $self->whensent(undef);
+    $self->send_method_used(undef);
+}
+
+sub as_hashref {
+    my ($self, $cols) = @_;
+    my $cobrand = $self->result_source->schema->cobrand;
+
+    my $state_t = FixMyStreet::DB->resultset("State")->display($self->state);
+
+    my $out = {
         id        => $self->id,
         title     => $self->title,
         category  => $self->category,
@@ -826,18 +915,234 @@ sub as_hashref {
         latitude  => $self->latitude,
         longitude => $self->longitude,
         postcode  => $self->postcode,
+        areas     => $self->areas,
         state     => $self->state,
-        state_t   => _( $self->state ),
+        state_t   => $state_t,
         used_map  => $self->used_map,
-        is_fixed  => $self->fixed_states->{ $self->state } ? 1 : 0,
-        photo     => $self->get_photo_params,
-        meta      => $self->confirmed ? $self->meta_line( $c ) : '',
-        confirmed_pp => $self->confirmed ? Utils::prettify_dt( $self->confirmed_local, 1 ): '',
-        created_pp => Utils::prettify_dt( $self->created_local, 1 ),
+        created   => $self->created,
+    };
+    $out->{is_fixed} = $self->fixed_states->{ $self->state } ? 1 : 0 if !$cols || $cols->{is_fixed};
+    $out->{photos} = [ map { $_->{url} } @{$self->photos} ] if !$cols || $cols->{photos};
+    $out->{meta} = $self->confirmed ? $self->meta_line : '' if !$cols || $cols->{meta};
+    $out->{created_pp} = $cobrand->prettify_dt( $self->created ) if !$cols || $cols->{created_pp};
+    if ($self->confirmed) {
+        $out->{confirmed} = $self->confirmed if !$cols || $cols->{confirmed};
+        $out->{confirmed_pp} = $cobrand->prettify_dt( $self->confirmed ) if !$cols || $cols->{confirmed_pp};
+    }
+    return $out;
+}
+
+__PACKAGE__->has_many(
+  "admin_log_entries",
+  "FixMyStreet::DB::Result::AdminLog",
+  { "foreign.object_id" => "self.id" },
+  {
+      cascade_copy => 0, cascade_delete => 0,
+      where => { 'object_type' => 'problem' },
+  }
+);
+
+sub moderation_filter {
+    my $self = shift;
+    { comment_id => undef };
+}
+
+sub get_time_spent {
+    my $self = shift;
+    my $admin_logs = $self->admin_log_entries->search({},
+        {
+            group_by => 'object_id',
+            columns => [
+                { sum_time_spent => { sum => 'time_spent' } },
+            ]
+        })->single;
+    return $admin_logs ? $admin_logs->get_column('sum_time_spent') : 0;
+}
+
+=head2 get_cobrand_logged
+
+Get a cobrand object for the cobrand the problem was logged for.
+
+e.g. if a problem was logged at www.fixmystreet.com, this will be a
+FixMyStreet::Cobrand::FixMyStreet object.
+
+=cut
+
+has get_cobrand_logged => (
+    is => 'ro',
+    lazy => 1,
+    default => sub {
+        my $self = shift;
+        my $cobrand_class = FixMyStreet::Cobrand->get_class_for_moniker( $self->cobrand );
+        return $cobrand_class->new;
+    },
+);
+
+
+sub pin_data {
+    my ($self, $page, %opts) = @_;
+    my $cobrand = $self->result_source->schema->cobrand;
+    my $colour = $cobrand->pin_colour($self, $page);
+    my $title = $opts{private} ? $self->title : $self->title_safe;
+    $title = $cobrand->call_hook(pin_hover_title => $self, $title) || $title;
+    {
+        latitude => $self->latitude,
+        longitude => $self->longitude,
+        colour => $colour,
+        id => $self->id,
+        title => $title,
+        problem => $self,
+        draggable => $opts{draggable},
+        type => $opts{type},
+        base_url => $cobrand->relative_url_for_report($self),
+    }
+};
+
+sub static_map {
+    my ($self, %params) = @_;
+
+    return unless $IM;
+
+    my $orig_map_class = FixMyStreet::Map::set_map_class('OSM')
+        unless $FixMyStreet::Map::map_class->isa("FixMyStreet::Map::OSM");
+
+    my $map_data = $FixMyStreet::Map::map_class->generate_map_data(
+        {
+            cobrand => $self->get_cobrand_logged,
+            distance => 1, # prevents the call to Gaze which isn't necessary
+            $params{zoom} ? ( zoom => $params{zoom} ) : (),
+        },
+        latitude  => $self->latitude,
+        longitude => $self->longitude,
+        pins      => $self->used_map
+        ? [ {
+            latitude  => $self->latitude,
+            longitude => $self->longitude,
+            colour    => $self->get_cobrand_logged->pin_colour($self, 'report'),
+            type      => 'big',
+          } ]
+        : [],
+    );
+
+    $ua->agent("FixMyStreet/1.0");
+    my $image;
+    for (my $i=0; $i<4; $i++) {
+        my $tile_url = $map_data->{tiles}->[$i];
+        if ($tile_url =~ m{^//}) {
+            $tile_url = "https:$tile_url";
+        }
+        my $tile;
+        if (FixMyStreet->test_mode) {
+            $tile = FixMyStreet->path_to('t/app/controller/sample.jpg')->slurp(iomode => '<:raw');
+        } else {
+            $tile = LWP::Simple::get($tile_url);
+        }
+        next unless $tile;
+        my $im = Image::Magick->new;
+        $im->BlobToImage($tile);
+        my $gravity = ($i<2?'North':'South') . ($i%2?'East':'West');
+        if (!$image) {
+            $image = $im;
+            $image->Extent(geometry => '512x512', gravity => $gravity);
+        } else {
+            $image->Composite(image => $im, gravity => $gravity);
+        }
+    }
+
+    unless ($image) {
+        FixMyStreet::Map::set_map_class($orig_map_class) if $orig_map_class;
+        return;
+    }
+
+    # The only pin might be the report pin, with added x/y
+    my $pin = $map_data->{pins}->[0];
+    if ($pin) {
+        my $im = Image::Magick->new;
+        $im->read(FixMyStreet->path_to('web', 'i', 'pin-yellow.png'));
+        $im->Scale( geometry => '48x64' );
+        $image->Composite(image => $im, gravity => 'NorthWest',
+            x => $pin->{px} - 24, y => $pin->{py} - 64);
+    }
+
+    # Bottom 128/ top 64 pixels will never have a pin
+    $image->Extent( geometry => '512x384', gravity => 'NorthWest');
+    $image->Extent( geometry => '512x320', gravity => 'SouthWest');
+
+    $image->Scale( geometry => "310x200>" ) unless $params{full_size};
+
+    my @blobs = $image->ImageToBlob(magick => 'jpeg');
+    undef $image;
+
+    FixMyStreet::Map::set_map_class($orig_map_class) if $orig_map_class;
+
+    return {
+        data => $blobs[0],
+        content_type => 'image/jpeg',
     };
 }
 
-# we need the inline_constructor bit as we don't inherit from Moose
-__PACKAGE__->meta->make_immutable( inline_constructor => 0 );
+has shortlisted_user => (
+    is => 'ro',
+    lazy => 1,
+    default => sub {
+        my $self = shift;
+        my $user = $self->user_planned_reports->active->first;
+        return $user->user if $user;
+    },
+);
+
+sub set_duplicate_of {
+    my ($self, $other_id) = @_;
+    $self->set_extra_metadata( duplicate_of => $other_id );
+    my $dupe = $self->result_source->schema->resultset("Problem")->find($other_id);
+    my $dupes_duplicates = $dupe->get_extra_metadata('duplicates') || [];
+    push @$dupes_duplicates, $self->id;
+    $dupe->set_extra_metadata( duplicates => $dupes_duplicates );
+    $dupe->update;
+}
+
+has duplicate_of => (
+    is => 'ro',
+    lazy => 1,
+    default => sub {
+        my $self = shift;
+        return unless $self->state eq 'duplicate';
+        my $duplicate_of = int($self->get_extra_metadata("duplicate_of") || 0);
+        return unless $duplicate_of;
+        return $self->result_source->schema->resultset('Problem')->search({ id => $duplicate_of })->first;
+    },
+);
+
+has duplicates => (
+    is => 'ro',
+    lazy => 1,
+    default => sub {
+        my $self = shift;
+        my $duplicates = $self->get_extra_metadata("duplicates") || [];
+        return [] unless $duplicates && @$duplicates;
+        my @duplicates = $self->result_source->schema->resultset('Problem')->search({ id => $duplicates })->all;
+        return \@duplicates;
+    },
+);
+
+has inspection_log_entry => (
+    is => 'ro',
+    lazy => 1,
+    default => sub {
+        my $self = shift;
+        return $self->admin_log_entries->search({ action => 'inspected' }, { order_by => { -desc => 'whenedited' } })->first;
+    },
+);
+
+has alerts => (
+    is => 'ro',
+    lazy => 1,
+    default => sub {
+        my $self = shift;
+        return $self->result_source->schema->resultset('Alert')->search({
+            alert_type => 'new_updates', parameter => $self->id
+        });
+    },
+);
 
 1;

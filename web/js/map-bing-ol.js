@@ -1,69 +1,35 @@
-var tile_base = [ [ '', 'a.', 'b.', 'c.' ], 'http://{S}tilma.mysociety.org/sv' ];
-
-function set_map_config(perm) {
-    var permalink_id;
-    if ($('#map_permalink').length) {
-        permalink_id = 'map_permalink';
-    }
-
-    var nav_opts = { zoomWheelEnabled: false };
-    if (fixmystreet.page == 'around' && $('html').hasClass('mobile')) {
-        nav_opts = {};
-    }
-    fixmystreet.nav_control = new OpenLayers.Control.Navigation(nav_opts);
-
+fixmystreet.maps.config = function() {
     fixmystreet.controls = [
         new OpenLayers.Control.Attribution(),
-        new OpenLayers.Control.ArgParser(),
-        fixmystreet.nav_control,
-        new OpenLayers.Control.Permalink(permalink_id),
+        new OpenLayers.Control.ArgParserFMS(),
+        new OpenLayers.Control.Navigation(),
+        new OpenLayers.Control.PermalinkFMS('map'),
         new OpenLayers.Control.PanZoomFMS({id: 'fms_pan_zoom' })
     ];
-    if (fixmystreet.map_type) {
-        tile_base = fixmystreet.map_type;
+    /* Linking back to around from report page, keeping track of map moves */
+    if ( fixmystreet.page == 'report' ) {
+        fixmystreet.controls.push( new OpenLayers.Control.PermalinkFMS('key-tool-problems-nearby', '/around') );
     }
-    fixmystreet.map_type = OpenLayers.Layer.BingUK;
-}
+};
 
-OpenLayers.Layer.BingUK = OpenLayers.Class(OpenLayers.Layer.XYZ, {
+$(function(){
+    $('.map-layer-toggle').on('click', fixmystreet.maps.toggle_base);
+    // If page loaded with Aerial as starting, rather than default road
+    if ($('.map-layer-toggle').text() == translation_strings.map_roads) {
+        fixmystreet.map.setBaseLayer(fixmystreet.map.layers[1]);
+    }
+});
+
+OpenLayers.Layer.Bing = OpenLayers.Class(OpenLayers.Layer.XYZ, {
+    tile_base: '//t{S}.ssl.ak.dynamic.tiles.virtualearth.net/comp/ch/${id}?mkt=en-US&it=G,L&src=t&shading=hill&og=969&n=z',
     attributionTemplate: '${logo}${copyrights}',
-
-    uk_bounds: [
-        new OpenLayers.Bounds(-6.6, 49.8, 1.102680, 51),
-        new OpenLayers.Bounds(-5.4, 51, 2.28, 54.94),
-        new OpenLayers.Bounds(-5.85, 54.94, -1.15, 55.33),
-        new OpenLayers.Bounds(-9.35, 55.33, -0.7, 60.98)
-    ],
-    in_uk: function(c) {
-        c = c.clone();
-        c.transform(
-            fixmystreet.map.getProjectionObject(),
-            new OpenLayers.Projection("EPSG:4326")
-        );
-        if ( this.uk_bounds[0].contains(c.lon, c.lat) || this.uk_bounds[1].contains(c.lon, c.lat) || this.uk_bounds[2].contains(c.lon, c.lat) || this.uk_bounds[3].contains(c.lon, c.lat) ) {
-            return true;
-        }
-        return false;
-    },
 
     setMap: function() {
         OpenLayers.Layer.XYZ.prototype.setMap.apply(this, arguments);
         this.updateAttribution();
-        this.map.events.register("moveend", this, this.updateAttribution);
     },
 
-    updateAttribution: function() {
-        var z = this.map.getZoom() + this.zoomOffset;
-        var copyrights;
-        var logo = '';
-        var c = this.map.getCenter();
-        var in_uk = c ? this.in_uk(c) : true;
-        if (z >= 16 && in_uk) {
-            copyrights = 'Contains Ordnance Survey data &copy; Crown copyright and database right 2010';
-        } else {
-            logo = '<a href="http://www.bing.com/maps/"><img border=0 src="//dev.virtualearth.net/Branding/logo_powered_by.png"></a>';
-            copyrights = '&copy; 2011 <a href="http://www.bing.com/maps/">Microsoft</a>. &copy; AND, Navteq, Ordnance Survey';
-        }
+    _updateAttribution: function(copyrights, logo) {
         this.attribution = OpenLayers.String.format(this.attributionTemplate, {
             logo: logo,
             copyrights: copyrights
@@ -76,16 +42,21 @@ OpenLayers.Layer.BingUK = OpenLayers.Class(OpenLayers.Layer.XYZ, {
         }
     },
 
+    updateAttribution: function() {
+        var year = (new Date()).getFullYear();
+        var copyrights = '&copy; ' + year + ' <a href="https://www.bing.com/maps/">Microsoft</a>, HERE';
+        var logo = '<a href="https://www.bing.com/maps/"><img border=0 src="//dev.virtualearth.net/Branding/logo_powered_by.png"></a>';
+        this._updateAttribution(copyrights, logo);
+    },
+
     initialize: function(name, options) {
         var url = [];
         options = OpenLayers.Util.extend({
             /* Below line added to OSM's file in order to allow minimum zoom level */
-            maxResolution: 156543.0339/Math.pow(2, options.zoomOffset || 0),
-            numZoomLevels: 18,
-            transitionEffect: "resize",
+            maxResolution: 156543.03390625/Math.pow(2, options.zoomOffset || 0),
+            numZoomLevels: 20,
             sphericalMercator: true,
             buffer: 0
-            //attribution: "© Microsoft / OS 2010"
         }, options);
         var newArguments = [name, url, options];
         OpenLayers.Layer.XYZ.prototype.initialize.apply(this, newArguments);
@@ -117,23 +88,7 @@ OpenLayers.Layer.BingUK = OpenLayers.Class(OpenLayers.Layer.XYZ, {
             OpenLayers.Util.indexOf(this.serverResolutions, res) :
             this.map.getZoom() + this.zoomOffset;
 
-        var url;
-        var in_uk = this.in_uk(bounds.getCenterLonLat());
-        if (z >= 16 && in_uk) {
-            url = [];
-            for (var i=0; i< tile_base[0].length; i++) {
-                url.push( tile_base[1].replace('{S}', tile_base[0][i]) + "/${z}/${x}/${y}.png" );
-            }
-        } else {
-            var type = '';
-            if (z > 10 && in_uk) { type = '&productSet=mmOS'; }
-            url = [
-                "//ecn.t0.tiles.virtualearth.net/tiles/r${id}.png?g=701" + type,
-                "//ecn.t1.tiles.virtualearth.net/tiles/r${id}.png?g=701" + type,
-                "//ecn.t2.tiles.virtualearth.net/tiles/r${id}.png?g=701" + type,
-                "//ecn.t3.tiles.virtualearth.net/tiles/r${id}.png?g=701" + type
-            ];
-        }
+        var url = this.get_urls(bounds, z);
         var s = '' + x + y + z;
         url = this.selectUrl(s, url);
        
@@ -142,5 +97,42 @@ OpenLayers.Layer.BingUK = OpenLayers.Class(OpenLayers.Layer.XYZ, {
         return path;
     },
 
-    CLASS_NAME: "OpenLayers.Layer.BingUK"
+    get_urls: function(bounds, z) {
+        var urls = [];
+        for (var i=0; i<4; i++) {
+            urls.push(this.tile_base.replace('{S}', i));
+        }
+        return urls;
+    },
+
+    CLASS_NAME: "OpenLayers.Layer.Bing"
 });
+
+OpenLayers.Layer.BingAerial = OpenLayers.Class(OpenLayers.Layer.Bing, {
+    tile_base: '//t{S}.ssl.ak.dynamic.tiles.virtualearth.net/comp/ch/${id}?mkt=en-US&it=A,G,L&src=t&og=969&n=z',
+
+    setMap: function() {
+        OpenLayers.Layer.Bing.prototype.setMap.apply(this, arguments);
+        this.map.events.register("moveend", this, this.updateAttribution);
+    },
+
+    updateAttribution: function() {
+        var z = this.map.getZoom() + this.zoomOffset;
+        var year = (new Date()).getFullYear();
+        var copyrights = '&copy; ' + year + ' <a href="https://www.bing.com/maps/">Microsoft</a>, HERE, ';
+        if (z >= 13) {
+            copyrights += 'Maxar, CNES Distribution Airbus DS';
+        } else {
+            copyrights += 'Earthstar Geographics SIO';
+        }
+        var logo = '<a href="https://www.bing.com/maps/"><img border=0 src="//dev.virtualearth.net/Branding/logo_powered_by.png"></a>';
+        this._updateAttribution(copyrights, logo);
+    },
+
+    CLASS_NAME: "OpenLayers.Layer.BingAerial"
+});
+
+fixmystreet.layer_options = [
+  { map_type: OpenLayers.Layer.Bing },
+  { map_type: OpenLayers.Layer.BingAerial }
+];

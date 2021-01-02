@@ -1,5 +1,3 @@
-#!/usr/bin/perl
-#
 # FixMyStreet:Geocode::OSM
 # OpenStreetmap forward and reverse geocoding for FixMyStreet.
 #
@@ -11,17 +9,13 @@ package FixMyStreet::Geocode::OSM;
 use warnings;
 use strict;
 
-use Digest::MD5 qw(md5_hex);
-use Encode;
-use File::Slurp;
-use File::Path ();
-use LWP::Simple qw($ua);
+use LWP::Simple;
 use Memcached;
 use XML::Simple;
-use mySociety::Locale;
+use Utils;
 
-my $osmapibase    = "http://www.openstreetmap.org/api/";
-my $nominatimbase = "http://nominatim.openstreetmap.org/";
+my $osmapibase    = "https://www.openstreetmap.org/api/";
+my $nominatimbase = "https://nominatim.openstreetmap.org/";
 
 # string STRING CONTEXT
 # Looks up on Nominatim, and caches, a user-inputted location.
@@ -29,12 +23,14 @@ my $nominatimbase = "http://nominatim.openstreetmap.org/";
 # an array of matches if there are more than one. The information in the query
 # may be used to disambiguate the location in cobranded versions of the site.
 sub string {
-    my ( $s, $c ) = @_;
+    my ( $cls, $s, $c ) = @_;
 
     my $params = $c->cobrand->disambiguate_location($s);
+    # Allow cobrand to fixup the user input
+    $s = $params->{string} if $params->{string};
 
     $s = FixMyStreet::Geocode::escape($s);
-    $s .= '+' . $params->{town} if $params->{town} and $s !~ /$params->{town}/i;
+    $s .= '%2C+' . $params->{town} if $params->{town} and $s !~ /$params->{town}/i;
 
     my $url = "${nominatimbase}search?";
     my %query_params = (
@@ -45,44 +41,37 @@ sub string {
     );
     $query_params{viewbox} = $params->{bounds}[1] . ',' . $params->{bounds}[2] . ',' . $params->{bounds}[3] . ',' . $params->{bounds}[0]
         if $params->{bounds};
+    $query_params{bounded} = 1
+        if $params->{bounds};
     $query_params{countrycodes} = $params->{country}
         if $params->{country};
-    $url .= join('&', map { "$_=$query_params{$_}" } keys %query_params);
+    $c->cobrand->call_hook(geocoder_munge_query_params => \%query_params);
+    $url .= join('&', map { "$_=$query_params{$_}" } sort keys %query_params);
 
-    my $cache_dir = FixMyStreet->config('GEO_CACHE') . 'osm/';
-    my $cache_file = $cache_dir . md5_hex($url);
-    my $js;
-    if (-s $cache_file) {
-        $js = File::Slurp::read_file($cache_file);
-    } else {
-        $ua->timeout(15);
-        $js = LWP::Simple::get($url);
-        $js = encode_utf8($js) if utf8::is_utf8($js);
-        File::Path::mkpath($cache_dir);
-        File::Slurp::write_file($cache_file, $js) if $js;
-    }
-
+    $c->stash->{geocoder_url} = $url;
+    my $js = FixMyStreet::Geocode::cache('osm', $url);
     if (!$js) {
         return { error => _('Sorry, we could not find that location.') };
     }
 
-    $js = JSON->new->utf8->allow_nonref->decode($js);
-
-    my ( $error, @valid_locations, $latitude, $longitude );
+    my ( $error, @valid_locations, $latitude, $longitude, $address );
     foreach (@$js) {
-        # These co-ordinates are output as query parameters in a URL, make sure they have a "."
-        ( $latitude, $longitude ) = ( $_->{lat}, $_->{lon} );
-        mySociety::Locale::in_gb_locale {
-            push (@$error, {
-                address => $_->{display_name},
-                latitude => sprintf('%0.6f', $latitude),
-                longitude => sprintf('%0.6f', $longitude)
-            });
-        };
+        $c->cobrand->call_hook(geocoder_munge_results => $_);
+        next unless $_->{display_name};
+        ( $latitude, $longitude ) =
+            map { Utils::truncate_coordinate($_) }
+            ( $_->{lat}, $_->{lon} );
+        $address = $_->{display_name};
+        push (@$error, {
+            address => $address,
+            icon => $_->{icon},
+            latitude => $latitude,
+            longitude => $longitude
+        });
         push (@valid_locations, $_);
     }
 
-    return { latitude => $latitude, longitude => $longitude } if scalar @valid_locations == 1;
+    return { latitude => $latitude, longitude => $longitude, address => $address } if scalar @valid_locations == 1;
     return { error => $error };
 }
 

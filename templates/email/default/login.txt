@@ -1,9 +1,13 @@
-Subject: [% loc('Your FixMyStreet.com account details') %]
+Subject: Your [% site_name %] account details
 
-Please click on the link below to confirm your email address. Then you will be
-able to view your problem reports and manage them more easily.
+Please click on the link below to confirm your email address.
 
 [% c.uri_for_action( 'auth/token', token ) %]
 
-[% INCLUDE 'signature.txt' %]
+Once you've done this, you'll be able to view and manage all reports and
+updates you've made on [% site_name %].
 
+[% signature %]
+
+This email was sent automatically, from an unmonitored email account - so
+please do not reply to it.

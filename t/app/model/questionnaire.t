@@ -1,16 +1,20 @@
-#!/usr/bin/perl
+package FixMyStreet::Cobrand::Tester;
 
-use strict;
-use warnings;
+use parent 'FixMyStreet::Cobrand::Default';
 
-use Test::More;
+sub send_questionnaire {
+    my ($self, $row) = @_;
+    return $row->latitude == 1;
+}
+
+package main;
 
 use FixMyStreet;
 use FixMyStreet::TestMech;
 
-my $user = FixMyStreet::App->model('DB::User')->find_or_create( { email => 'test@example.com' } );
+my $user = FixMyStreet::DB->resultset('User')->find_or_create( { email => 'test@example.com' } );
 
-my $problem = FixMyStreet::App->model('DB::Problem')->create(
+my $problem = FixMyStreet::DB->resultset('Problem')->create(
     {
         postcode     => 'EH99 1SP',
         latitude     => 1,
@@ -25,18 +29,16 @@ my $problem = FixMyStreet::App->model('DB::Problem')->create(
         service      => '',
         cobrand      => 'default',
         cobrand_data => '',
-        confirmed    => \"ms_current_timestamp() - '5 weeks'::interval",
-        whensent     => \"ms_current_timestamp() - '5 weeks'::interval",
+        confirmed    => \"current_timestamp - '5 weeks'::interval",
+        whensent     => \"current_timestamp - '5 weeks'::interval",
         user         => $user,
         anonymous    => 0,
     }
 );
 
-diag $problem->id;
-
 my $mech = FixMyStreet::TestMech->new;
 
-for my $test ( 
+for my $test (
     {
         state => 'unconfirmed',
         send_email => 0,
@@ -83,22 +85,22 @@ for my $test (
     },
     {
         state => 'duplicate',
-        send_email => 1,
+        send_email => 0,
     },
     {
         state => 'unable to fix',
-        send_email => 1,
+        send_email => 0,
     },
     {
         state => 'not responsible',
-        send_email => 1,
+        send_email => 0,
     },
     {
         state => 'closed',
-        send_email => 1,
+        send_email => 0,
     },
 ) {
-    subtest "correct questionnaire behviour for state $test->{state}" => sub {
+    subtest "correct questionnaire behaviour for state $test->{state}" => sub {
         $problem->discard_changes;
         $problem->state( $test->{state} );
         $problem->send_questionnaire( 1 );
@@ -108,7 +110,7 @@ for my $test (
 
         $mech->email_count_is(0);
 
-        FixMyStreet::App->model('DB::Questionnaire')
+        FixMyStreet::DB->resultset('Questionnaire')
           ->send_questionnaires( { site => 'fixmystreet' } );
 
         $mech->email_count_is( $test->{send_email} );
@@ -117,6 +119,29 @@ for my $test (
     }
 }
 
-$mech->delete_user( $user );
+for my $test (
+    { latitude => 2, emails => 0, },
+    { latitude => 1, emails => 1, },
+) {
+    subtest "test cobrand questionnaire send override, expecting $test->{emails} email" => sub {
+        FixMyStreet::override_config {
+            ALLOWED_COBRANDS => 'tester',
+        }, sub {
+            $problem->latitude($test->{latitude});
+            $problem->send_questionnaire(1);
+            $problem->state('confirmed');
+            $problem->update;
+            $problem->questionnaires->delete;
+
+            $mech->email_count_is(0);
+            FixMyStreet::DB->resultset('Questionnaire')->send_questionnaires( { site => 'tester' } );
+            $mech->email_count_is($test->{emails});
+            $mech->clear_emails_ok();
+
+            $problem->discard_changes;
+            is $problem->send_questionnaire, 0;
+        };
+    };
+}
 
 done_testing();

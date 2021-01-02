@@ -1,24 +1,17 @@
-#!/usr/bin/perl
-
-use strict;
-use warnings;
-
-use Test::More;
-
-use FixMyStreet;
-use FixMyStreet::App;
 use FixMyStreet::TestMech;
-use mySociety::Locale;
+use FixMyStreet;
+use FixMyStreet::DB;
+use FixMyStreet::Script::Reports;
+use Open311::GetUpdates;
+use Sub::Override;
 
-mySociety::Locale::gettext_domain('FixMyStreet');
-
-my $problem_rs = FixMyStreet::App->model('DB::Problem');
+my $problem_rs = FixMyStreet::DB->resultset('Problem');
 
 my $problem = $problem_rs->new(
     {
         postcode     => 'EH99 1SP',
-        latitude     => '51.5016605453401',
-        longitude    => '-0.142497580865087',
+        latitude     => '54.5',
+        longitude    => '-1.5',
         areas        => 1,
         title        => '',
         detail       => '',
@@ -32,12 +25,29 @@ my $problem = $problem_rs->new(
     }
 );
 
-is $problem->confirmed_local,  undef, 'inflating null confirmed ok';
-is $problem->whensent_local,   undef, 'inflating null confirmed ok';
-is $problem->lastupdate_local, undef, 'inflating null confirmed ok';
-is $problem->created_local,  undef, 'inflating null confirmed ok';
+my $visible_states = $problem->visible_states;
+is_deeply $visible_states, {
+    'confirmed'                   => 1,
+    'investigating'               => 1,
+    'in progress'                 => 1,
+    'planned'                     => 1,
+    'action scheduled'            => 1,
+    'fixed'                       => 1,
+    'fixed - council'             => 1,
+    'fixed - user'                => 1,
+    'unable to fix'               => 1,
+    'not responsible'             => 1,
+    'duplicate'                   => 1,
+    'closed'                      => 1,
+    'internal referral'           => 1,
+    }, 'visible_states is correct';
 
-for my $test ( 
+is $problem->confirmed,  undef, 'inflating null confirmed ok';
+is $problem->whensent,   undef, 'inflating null confirmed ok';
+is $problem->lastupdate, undef, 'inflating null confirmed ok';
+is $problem->created,  undef, 'inflating null confirmed ok';
+
+for my $test (
     {
         desc => 'more or less empty problem',
         changed => {},
@@ -46,30 +56,6 @@ for my $test (
             detail => 'Please enter some details',
             bodies => 'No council selected',
             name => 'Please enter your name',
-        }
-    },
-    {
-        desc => 'name too short',
-        changed => {
-            name => 'xx',
-        },
-        errors => {
-            title => 'Please enter a subject',
-            detail => 'Please enter some details',
-            bodies => 'No council selected',
-            name => 'Please enter your full name, councils need this information – if you do not wish your name to be shown on the site, untick the box below',
-        }
-    },
-    {
-        desc => 'name is anonymous',
-        changed => {
-            name => 'anonymous',
-        },
-        errors => {
-            title => 'Please enter a subject',
-            detail => 'Please enter some details',
-            bodies => 'No council selected',
-            name => 'Please enter your full name, councils need this information – if you do not wish your name to be shown on the site, untick the box below',
         }
     },
     {
@@ -120,24 +106,6 @@ for my $test (
         }
     },
     {
-        desc => 'bad category',
-        changed => {
-            category => '-- Pick a category --',
-        },
-        errors => {
-            category => 'Please choose a category',
-        }
-    },
-    {
-        desc => 'bad category',
-        changed => {
-            category => '-- Pick a property type --',
-        },
-        errors => {
-            category => 'Please choose a property type',
-        }
-    },
-    {
         desc => 'correct category',
         changed => {
             category => 'Horse!',
@@ -153,9 +121,9 @@ for my $test (
     };
 }
 
-my $user = FixMyStreet::App->model('DB::User')->find_or_create(
+my $user = FixMyStreet::DB->resultset('User')->find_or_create(
     {
-        email => 'system_user@example.com'
+        email => 'system_user@example.net'
     }
 );
 
@@ -166,67 +134,40 @@ $problem->anonymous(1);
 $problem->insert;
 
 my $tz_local = DateTime::TimeZone->new( name => 'local' );
+my $comment_time = DateTime->now->set_time_zone( $tz_local );
+
+my $body = FixMyStreet::DB->resultset('Body')->new({
+    name => 'Edinburgh City Council'
+});
 
 for my $test (
     {
-        desc => 'request older than problem ignored',
-        lastupdate => '',
+        desc => 'request after problem created',
         request => {
-            updated_datetime => DateTime::Format::W3CDTF->new()->format_datetime( DateTime->now()->set_time_zone( $tz_local )->subtract( days => 2 ) ),
-        },
-        council => {
-            name => 'Edinburgh City Council',
-        },
-        created => 0,
-    },
-    {
-        desc => 'request newer than problem created',
-        lastupdate => '',
-        request => {
-            updated_datetime => DateTime::Format::W3CDTF->new()->format_datetime( DateTime->now()->set_time_zone( $tz_local ) ),
             status => 'open',
-            status_notes => 'this is an update from the council',
+            comment_time => $comment_time,
+            description => 'this is an update from the council',
         },
-        council => {
-            name => 'Edinburgh City Council',
-        },
-        created => 1,
         state => 'confirmed',
-        mark_fixed => 0,
-        mark_open => 0,
     },
     {
         desc => 'update with state of closed fixes problem',
-        lastupdate => '',
         request => {
-            updated_datetime => DateTime::Format::W3CDTF->new()->format_datetime( DateTime->now()->set_time_zone( $tz_local ) ),
+            comment_time => $comment_time,
             status => 'closed',
-            status_notes => 'the council have fixed this',
+            description => 'the council have fixed this',
         },
-        council => {
-            name => 'Edinburgh City Council',
-        },
-        created => 1,
-        state => 'fixed',
-        mark_fixed => 1,
-        mark_open => 0,
+        state => 'fixed - council',
     },
     {
-        desc => 'update with state of open leaves problem as fixed',
-        lastupdate => '',
+        desc => 'update with state of open reopens problem',
         request => {
-            updated_datetime => DateTime::Format::W3CDTF->new()->format_datetime( DateTime->now()->set_time_zone( $tz_local ) ),
+            comment_time => $comment_time,
             status => 'open',
-            status_notes => 'the council do not think this is fixed',
+            description => 'the council do not think this is fixed',
         },
-        council => {
-            name => 'Edinburgh City Council',
-        },
-        created => 1,
-        start_state => 'fixed',
-        state => 'fixed',
-        mark_fixed => 0,
-        mark_open => 0,
+        start_state => 'fixed - council',
+        state => 'confirmed',
     },
 ) {
     subtest $test->{desc} => sub {
@@ -238,32 +179,30 @@ for my $test (
         $problem->update;
         my $w3c = DateTime::Format::W3CDTF->new();
 
-        my $ret = $problem->update_from_open311_service_request( $test->{request}, $test->{council}, $user );
-        is $ret, $test->{created}, 'return value';
-
-        return unless $test->{created};
+        my $o = Open311->new( jurisdiction => 'mysociety', endpoint => 'http://example.com', test_mode => 1 );
+        my $updates = Open311::GetUpdates->new(
+            current_open311 => $o,
+            current_body => $body,
+            system_user => $user,
+        );
+        my $update = $updates->process_update($test->{request}, $problem);
 
         $problem->discard_changes;
-        is $problem->lastupdate, $w3c->parse_datetime($test->{request}->{updated_datetime}), 'lastupdate time';
-
-        my $update = $problem->comments->first;
+        is $problem->lastupdate, $test->{request}->{comment_time}, 'lastupdate time';
 
         ok $update, 'updated created';
-
         is $problem->state, $test->{state}, 'problem state';
-
-        is $update->text, $test->{request}->{status_notes}, 'update text';
-        is $update->mark_open, $test->{mark_open}, 'update mark_open flag';
-        is $update->mark_fixed, $test->{mark_fixed}, 'update mark_fixed flag';
+        is $update->text, $test->{request}->{description}, 'update text';
     };
 }
 
-for my $test ( 
+for my $test (
     {
         state => 'partial',
         is_visible  => 0,
         is_fixed    => 0,
         is_open     => 0,
+        is_in_progress => 0,
         is_closed   => 0,
     },
     {
@@ -271,6 +210,7 @@ for my $test (
         is_visible => 0,
         is_fixed    => 0,
         is_open     => 0,
+        is_in_progress => 0,
         is_closed   => 0,
     },
     {
@@ -278,6 +218,7 @@ for my $test (
         is_visible => 0,
         is_fixed    => 0,
         is_open     => 0,
+        is_in_progress => 0,
         is_closed   => 0,
     },
     {
@@ -285,6 +226,7 @@ for my $test (
         is_visible => 1,
         is_fixed    => 0,
         is_open     => 1,
+        is_in_progress => 0,
         is_closed   => 0,
     },
     {
@@ -292,6 +234,7 @@ for my $test (
         is_visible => 1,
         is_fixed    => 0,
         is_open     => 1,
+        is_in_progress => 1,
         is_closed   => 0,
     },
     {
@@ -299,6 +242,7 @@ for my $test (
         is_visible => 1,
         is_fixed    => 0,
         is_open     => 1,
+        is_in_progress => 1,
         is_closed   => 0,
     },
     {
@@ -306,6 +250,7 @@ for my $test (
         is_visible => 1,
         is_fixed    => 0,
         is_open     => 1,
+        is_in_progress => 1,
         is_closed   => 0,
     },
     {
@@ -313,6 +258,7 @@ for my $test (
         is_visible => 1,
         is_fixed    => 0,
         is_open     => 1,
+        is_in_progress => 1,
         is_closed   => 0,
     },
     {
@@ -320,6 +266,7 @@ for my $test (
         is_visible => 1,
         is_fixed    => 0,
         is_open     => 0,
+        is_in_progress => 0,
         is_closed   => 1,
     },
     {
@@ -327,6 +274,7 @@ for my $test (
         is_visible => 1,
         is_fixed    => 0,
         is_open     => 0,
+        is_in_progress => 0,
         is_closed   => 1,
     },
     {
@@ -334,6 +282,7 @@ for my $test (
         is_visible => 1,
         is_fixed    => 0,
         is_open     => 0,
+        is_in_progress => 0,
         is_closed   => 1,
     },
     {
@@ -341,6 +290,7 @@ for my $test (
         is_visible => 1,
         is_fixed    => 1,
         is_open     => 0,
+        is_in_progress => 0,
         is_closed   => 0,
     },
     {
@@ -348,6 +298,7 @@ for my $test (
         is_visible => 1,
         is_fixed    => 1,
         is_open     => 0,
+        is_in_progress => 0,
         is_closed   => 0,
     },
     {
@@ -355,6 +306,7 @@ for my $test (
         is_visible => 1,
         is_fixed    => 1,
         is_open     => 0,
+        is_in_progress => 0,
         is_closed   => 0,
     },
     {
@@ -362,6 +314,7 @@ for my $test (
         is_visible => 1,
         is_fixed    => 0,
         is_open     => 0,
+        is_in_progress => 0,
         is_closed   => 1,
     },
 ) {
@@ -371,78 +324,75 @@ for my $test (
         is $problem->is_fixed, $test->{is_fixed}, 'is_fixed';
         is $problem->is_closed, $test->{is_closed}, 'is_closed';
         is $problem->is_open, $test->{is_open}, 'is_open';
+        is $problem->is_in_progress, $test->{is_in_progress}, 'is_in_progress';
     };
 }
 
 my $mech = FixMyStreet::TestMech->new();
 
-my %contact_params = (
-    confirmed => 1,
-    deleted => 0,
-    editor => 'Test',
-    whenedited => \'ms_current_timestamp()',
-    note => 'Created for test',
-);
-
+my %body_ids;
+my @bodies;
 for my $body (
-    { id => 2651, name => 'City of Edinburgh Council' },
-    { id => 2226, name => 'Gloucestershire County Council' },
-    { id => 2326, name => 'Cheltenham Borough Council' },
-    { id => 2434, name => 'Lichfield District Council' },
-    { id => 2240, name => 'Staffordshire County Council' },
-    { id => 14279, name => 'Ballymoney Borough Council' },
-    { id => 2636, name => 'Isle of Wight Council' },
-    { id => 2649, name => 'Fife Council' },
+    { area_id => 2651, name => 'City of Edinburgh Council' },
+    { area_id => 2226, name => 'Gloucestershire County Council' },
+    { area_id => 2326, name => 'Cheltenham Borough Council' },
+    { area_id => 2333, name => 'Hart Council' },
+    { area_id => 2227, name => 'Hampshire County Council' },
+    { area_id => 14279, name => 'Ballymoney Borough Council' },
+    { area_id => 2636, name => 'Isle of Wight Council' },
+    { area_id => 2649, name => 'Fife Council' },
+    { area_id => 14279, name => 'TransportNI (Western)' },
 ) {
-    $mech->create_body_ok($body->{id}, $body->{name});
+    my $aid = $body->{area_id};
+    my $body = $mech->create_body_ok($aid, $body->{name});
+    if ($body_ids{$aid}) {
+        $body_ids{$aid} = [ $body_ids{$aid}, $body->id ];
+    } else {
+        $body_ids{$aid} = $body->id;
+    }
+    push @bodies, $body;
 }
 
 # Let's make some contacts to send things to!
-FixMyStreet::App->model('DB::Contact')->search( {
-    email => { 'like', '%example.com' },
-} )->delete;
-my @contacts;
 for my $contact ( {
-    body_id => 2651, # Edinburgh
+    body_id => $body_ids{2651}, # Edinburgh
     category => 'potholes',
     email => 'test@example.org',
 }, {
-    body_id => 2226, # Gloucestershire
+    body_id => $body_ids{2226}, # Gloucestershire
     category => 'potholes',
     email => '2226@example.org',
 }, {
-    body_id => 2326, # Cheltenham
+    body_id => $body_ids{2326}, # Cheltenham
     category => 'potholes',
     email => '2326@example.org',
 }, {
-    body_id => 2434, # Lichfield
+    body_id => $body_ids{2333}, # Hart
     category => 'potholes',
     email => 'trees@example.com',
 }, {
-    body_id => 2240, # Staffordshire
+    body_id => $body_ids{2227}, # Hampshire
     category => 'potholes',
     email => 'highways@example.com',
 }, {
-    body_id => 14279, # Ballymoney
+    body_id => $body_ids{14279}[1], # TransportNI
     category => 'Street lighting',
     email => 'roads.western@drdni.example.org',
 }, {
-    body_id => 14279, # Ballymoney
+    body_id => $body_ids{14279}[0], # Ballymoney
     category => 'Graffiti',
-    email => 'highways@example.com',
+    email => 'highways@example.net',
 }, {
-    confirmed => 0,
-    body_id => 2636, # Isle of Wight
+    state => 'unconfirmed',
+    body_id => $body_ids{2636}, # Isle of Wight
     category => 'potholes',
     email => '2636@example.com',
 } ) {
-    my $new_contact = FixMyStreet::App->model('DB::Contact')->find_or_create( { %contact_params, %$contact } );
-    ok $new_contact, "created test contact";
-    push @contacts, $new_contact;
+    $mech->create_contact_ok( %$contact );
 }
 
 my %common = (
-    email => 'system_user@example.com',
+    email => 'system_user@example.net',
     name => 'Andrew Smith',
 );
 foreach my $test ( {
@@ -452,21 +402,21 @@ foreach my $test ( {
         email_count   => 1,
         dear          => qr'Dear City of Edinburgh Council',
         to            => qr'City of Edinburgh Council',
-        body          => 2651,
+        body          => $body_ids{2651},
     }, {
         %common,
         desc          => 'no email sent if no unsent problems',
         unset_whendef => 0,
         email_count   => 0,
-        body          => 2651,
+        body          => $body_ids{2651},
     }, {
         %common,
         desc          => 'email to two tier council',
         unset_whendef => 1,
         email_count   => 1,
-        to            => qr'Gloucestershire County Council.*Cheltenham Borough Council',
-        dear          => qr'Dear Gloucestershire County Council and Cheltenham Borough',
-        body          => '2226,2326',
+        to            => qr'Cheltenham Borough Council.*Gloucestershire County Council',
+        dear          => qr'Dear Cheltenham Borough Council and Gloucestershire County',
+        body          => $body_ids{2226} . ',' . $body_ids{2326},
         multiple      => 1,
     }, {
         %common,
@@ -475,28 +425,29 @@ foreach my $test ( {
         email_count   => 1,
         to            => qr'Gloucestershire County Council" <2226@example',
         dear          => qr'Dear Gloucestershire County Council,',
-        body          => '2226|2649',
+        body          => $body_ids{2226},
+        body_missing  => $body_ids{2649},
         missing       => qr'problem might be the responsibility of Fife.*Council'ms,
     }, {
         %common,
         desc          => 'email to two tier council that only shows district, district',
         unset_whendef => 1,
         email_count   => 1,
-        to            => qr'Lichfield District Council',
-        dear          => qr'Dear Lichfield District Council,',
-        body          => '2434',
-        cobrand       => 'lichfielddc',
-        url           => 'lichfielddc.',
+        to            => qr'Hart Council',
+        dear          => qr'Dear Hart Council,',
+        body          => $body_ids{2333},
+        cobrand       => 'hart',
+        url           => 'hart.',
     }, {
         %common,
         desc          => 'email to two tier council that only shows district, county',
         unset_whendef => 1,
         email_count   => 1,
-        to            => qr'Staffordshire County Council" <highways@example',
-        dear          => qr'Dear Staffordshire County Council,',
-        body          => '2240',
-        cobrand       => 'lichfielddc',
-        url           => '',
+        to            => qr'Hampshire County Council" <highways@example',
+        dear          => qr'Dear Hampshire County Council,',
+        body          => $body_ids{2227},
+        cobrand       => 'hart',
+        url           => 'www.',
     }, {
         %common,
         desc          => 'directs NI correctly, 1',
@@ -504,72 +455,96 @@ foreach my $test ( {
         email_count   => 1,
         dear          => qr'Dear Ballymoney Borough Council',
         to            => qr'Ballymoney Borough Council',
-        body          => 14279,
+        body          => $body_ids{14279}[0],
         category      => 'Graffiti',
+        longitude => -6.5,
+        # As Ballmoney contact has same domain as reporter, the From line will
+        # become a unique reply address and Reply-To will become the reporter
+        reply_to => 1,
     }, {
         %common,
         desc          => 'directs NI correctly, 2',
         unset_whendef => 1,
         email_count   => 1,
-        dear          => qr'Dear Roads Service \(Western\)',
-        to            => qr'Roads Service \(Western\)" <roads',
-        body          => 14279,
+        dear          => qr'Dear TransportNI \(Western\)',
+        to            => qr'TransportNI \(Western\)" <roads',
+        body          => $body_ids{14279}[1],
         category      => 'Street lighting',
+        longitude => -6.5,
     }, {
         %common,
         desc          => 'does not send to unconfirmed contact',
         unset_whendef => 1,
         stays_unsent  => 1,
         email_count   => 0,
-        body          => 2636,
+        body          => $body_ids{2636},
     },
 ) {
     subtest $test->{ desc } => sub {
-        if ( $test->{cobrand} && $test->{cobrand} =~ /lichfielddc/ && !FixMyStreet::Cobrand->exists('lichfielddc') ) {
-            plan skip_all => 'Skipping Lichfield tests without Lichfield cobrand';
+        my $override = {
+            ALLOWED_COBRANDS => [ 'fixmystreet' ],
+            MAPIT_URL => 'http://mapit.uk/',
+            BASE_URL => 'http://www.fixmystreet.com',
+        };
+        if ( $test->{cobrand} && $test->{cobrand} =~ /hart/ ) {
+            $override->{ALLOWED_COBRANDS} = [ 'hart' ];
         }
 
         $mech->clear_emails_ok;
 
-        FixMyStreet::App->model('DB::Problem')->search(
+        $problem_rs->search(
             {
                 whensent => undef
             }
-        )->update( { whensent => \'ms_current_timestamp()' } );
+        )->update( { whensent => \'current_timestamp' } );
 
         $problem->discard_changes;
         $problem->update( {
             bodies_str => $test->{ body },
+            bodies_missing => $test->{ body_missing },
             state => 'confirmed',
-            confirmed => \'ms_current_timestamp()',
-            whensent => $test->{ unset_whendef } ? undef : \'ms_current_timestamp()',
+            confirmed => \'current_timestamp',
+            whensent => $test->{ unset_whendef } ? undef : \'current_timestamp',
             category => $test->{ category } || 'potholes',
             name => $test->{ name },
             cobrand => $test->{ cobrand } || 'fixmystreet',
+            longitude => $test->{longitude} || '-1.5',
         } );
 
-        FixMyStreet::App->model('DB::Problem')->send_reports();
+        FixMyStreet::override_config $override, sub {
+            FixMyStreet::Script::Reports::send();
+        };
 
         $mech->email_count_is( $test->{ email_count } );
         if ( $test->{ email_count } ) {
             my $email = $mech->get_email;
             like $email->header('To'), $test->{ to }, 'to line looks correct';
-            is $email->header('From'), sprintf('"%s" <%s>', $test->{ name }, $test->{ email } ), 'from line looks correct';
+            if ($test->{reply_to}) {
+                is $email->header('Reply-To'), sprintf('"%s" <%s>', $test->{ name }, $test->{ email } ), 'Reply-To line looks correct';
+                like $email->header('From'), qr/"$test->{name}" <fms-report-\d+-\w+\@example.org>/, 'from line looks correct';
+            } else {
+                is $email->header('From'), sprintf('"%s" <%s>', $test->{ name }, $test->{ email } ), 'from line looks correct';
+            }
             like $email->header('Subject'), qr/A Title/, 'subject line looks correct';
-            like $email->body, qr/A user of FixMyStreet/, 'email body looks a bit like a report';
-            like $email->body, qr/Subject: A Title/, 'more email body checking';
-            like $email->body, $test->{ dear }, 'Salutation looks correct';
+            my $body = $mech->get_text_body_from_email($email);
+            like $body, qr/A user of FixMyStreet/, 'email body looks a bit like a report';
+            like $body, qr/Subject: A Title/, 'more email body checking';
+            like $body, $test->{ dear }, 'Salutation looks correct';
+            if ($test->{longitude}) {
+                like $body, qr{Easting/Northing \(IE\): 297279/362371};
+            } else {
+                like $body, qr{Easting/Northing: };
+            }
 
             if ( $test->{multiple} ) {
-                like $email->body, qr/This email has been sent to several councils /, 'multiple body text correct';
+                like $body, qr/This email has been sent to several councils /, 'multiple body text correct';
             } elsif ( $test->{ missing } ) {
-                like $email->body, $test->{ missing }, 'missing body information correct';
+                like $body, $test->{ missing }, 'missing body information correct';
             }
 
             if ( $test->{url} ) {
-                (my $base_url = FixMyStreet->config('BASE_URL')) =~ s{http://}{};
                 my $id = $problem->id;
-                like $email->body, qr[$test->{url}$base_url/report/$id], 'URL present is correct';
+                like $body, qr[$test->{url}fixmystreet.com/report/$id], 'URL present is correct';
             }
 
             $problem->discard_changes;
@@ -582,59 +557,288 @@ foreach my $test ( {
     };
 }
 
-subtest 'check can turn on report sent email alerts' => sub {
-    eval 'use Test::MockModule; 1' or
-        plan skip_all => 'Skipping tests that rely on Test::MockModule';
+subtest 'check can set multiple emails as a single contact' => sub {
+    my $override = {
+        ALLOWED_COBRANDS => [ 'fixmystreet' ],
+        MAPIT_URL => 'http://mapit.uk/',
+    };
+
+    my $contact = {
+        body_id => $body_ids{2651}, # Edinburgh
+        category => 'trees',
+        email => '2636@example.com,2636-2@example.com',
+    };
+    $mech->create_contact_ok( %$contact );
 
     $mech->clear_emails_ok;
 
-    FixMyStreet::App->model('DB::Problem')->search(
+    $problem_rs->search(
         {
             whensent => undef
         }
-    )->update( { whensent => \'ms_current_timestamp()' } );
+    )->update( { whensent => \'current_timestamp' } );
 
     $problem->discard_changes;
     $problem->update( {
-        council => 2651,
+        bodies_str => $contact->{ body_id },
         state => 'confirmed',
-        confirmed => \'ms_current_timestamp()',
+        confirmed => \'current_timestamp',
+        whensent => undef,
+        category => 'trees',
+        name => 'Test User',
+        cobrand => 'fixmystreet',
+        send_fail_count => 0,
+    } );
+
+    FixMyStreet::override_config $override, sub {
+        FixMyStreet::Script::Reports::send();
+    };
+
+    $problem->discard_changes;
+    is_deeply $problem->get_extra_metadata('sent_to'), [ '2636@example.com', '2636-2@example.com' ];
+    $mech->email_count_is(1);
+    my $email = $mech->get_email;
+    is $email->header('To'), '"City of Edinburgh Council" <2636@example.com>, "City of Edinburgh Council" <2636-2@example.com>', 'To contains two email addresses';
+};
+
+subtest 'check can turn on report sent email alerts' => sub {
+    my $send_confirmation_mail_override = Sub::Override->new(
+        "FixMyStreet::Cobrand::Default::report_sent_confirmation_email",
+        sub { return 'external_id'; }
+    );
+    $mech->clear_emails_ok;
+
+    $problem_rs->search(
+        {
+            whensent => undef
+        }
+    )->update( { whensent => \'current_timestamp' } );
+
+    $problem->discard_changes;
+    $problem->update( {
+        bodies_str => $body_ids{2651},
+        state => 'confirmed',
+        confirmed => \'current_timestamp',
         whensent => undef,
         category => 'potholes',
         name => 'Test User',
         cobrand => 'fixmystreet',
+        send_fail_count => 0,
     } );
 
-    my $m = new Test::MockModule(
-        'FixMyStreet::Cobrand::FixMyStreet' );
-    $m->mock( report_sent_confirmation_email => 1 );
-    FixMyStreet::App->model('DB::Problem')->send_reports();
+    FixMyStreet::Script::Reports::send();
 
     $mech->email_count_is( 2 );
     my @emails = $mech->get_email;
     my $email = $emails[0];
 
     like $email->header('To'),qr/City of Edinburgh Council/, 'to line looks correct';
-    is $email->header('From'), '"Test User" <system_user@example.com>', 'from line looks correct';
+    is $email->header('From'), '"Test User" <system_user@example.net>', 'from line looks correct';
     like $email->header('Subject'), qr/A Title/, 'subject line looks correct';
-    like $email->body, qr/A user of FixMyStreet/, 'email body looks a bit like a report';
-    like $email->body, qr/Subject: A Title/, 'more email body checking';
-    like $email->body, qr/Dear City of Edinburgh Council/, 'Salutation looks correct';
+    my $body = $mech->get_text_body_from_email($email);
+    like $body, qr/A user of FixMyStreet/, 'email body looks a bit like a report';
+    like $body, qr/Subject: A Title/, 'more email body checking';
+    like $body, qr/Dear City of Edinburgh Council/, 'Salutation looks correct';
 
     $problem->discard_changes;
     ok defined( $problem->whensent ), 'whensent set';
+    is_deeply $problem->get_extra_metadata('sent_to'), [ 'test@example.org' ];
 
     $email = $emails[1];
-    like $email->header('Subject'), qr/Problem Report Sent/, 'report sent email title correct';
-    like $email->body, qr/Your report about/, 'report sent body correct';
+    like $email->header('Subject'), qr/FixMyStreet Report Sent/, 'report sent email title correct';
+    $body = $mech->get_text_body_from_email($email);
+    like $body, qr/to submit your report/, 'report sent body correct';
+
+    $send_confirmation_mail_override->restore();
 };
 
-$problem->comments->delete;
-$problem->delete;
-$mech->delete_user( $user );
 
-foreach (@contacts) {
-    $_->delete;
+subtest 'check iOS app store test reports not sent' => sub {
+    $mech->clear_emails_ok;
+
+    $problem_rs->search(
+        {
+            whensent => undef
+        }
+    )->update( { whensent => \'current_timestamp' } );
+
+    $problem->discard_changes;
+    $problem->update( {
+        bodies_str => $body_ids{2651},
+        title => 'App store test',
+        state => 'confirmed',
+        confirmed => \'current_timestamp',
+        whensent => undef,
+        category => 'potholes',
+        send_fail_count => 0,
+    } );
+
+    FixMyStreet::Script::Reports::send();
+
+    $mech->email_count_is( 0 );
+
+    $problem->discard_changes();
+    is $problem->state, 'hidden', 'iOS test reports are hidden automatically';
+    is $problem->whensent, undef, 'iOS test reports are not sent';
+};
+
+subtest 'check reports from abuser not sent' => sub {
+    $mech->clear_emails_ok;
+
+    $problem_rs->search(
+        {
+            whensent => undef
+        }
+    )->update( { whensent => \'current_timestamp' } );
+
+    $problem->discard_changes;
+    $problem->update( {
+        bodies_str => $body_ids{2651},
+        title => 'Report',
+        state => 'confirmed',
+        confirmed => \'current_timestamp',
+        whensent => undef,
+        category => 'potholes',
+        send_fail_count => 0,
+    } );
+
+    FixMyStreet::Script::Reports::send();
+
+    $mech->email_count_is( 1 );
+
+    $problem->discard_changes();
+    ok $problem->whensent, 'Report has been sent';
+
+    $problem->update( {
+        state => 'confirmed',
+        confirmed => \'current_timestamp',
+        whensent => undef,
+    } );
+
+    my $abuse = FixMyStreet::DB->resultset('Abuse')->create( { email => $problem->user->email } );
+
+    $mech->clear_emails_ok;
+    FixMyStreet::Script::Reports::send();
+
+    $mech->email_count_is( 0 );
+
+    $problem->discard_changes();
+    is $problem->state, 'hidden', 'reports from abuse user are hidden automatically';
+    is $problem->whensent, undef, 'reports from abuse user are not sent';
+
+    ok $abuse->delete(), 'user removed from abuse table';
+};
+
+subtest 'check response templates' => sub {
+    my $c1 = $mech->create_contact_ok(category => 'Potholes', body_id => $body_ids{2651}, email => 'p');
+    my $c2 = $mech->create_contact_ok(category => 'Graffiti', body_id => $body_ids{2651}, email => 'g');
+    my $t1 = FixMyStreet::DB->resultset('ResponseTemplate')->create({ body_id => $body_ids{2651}, title => "Title 1", text => "Text 1" });
+    my $t2 = FixMyStreet::DB->resultset('ResponseTemplate')->create({ body_id => $body_ids{2651}, title => "Title 2", text => "Text 2" });
+    my $t3 = FixMyStreet::DB->resultset('ResponseTemplate')->create({ body_id => $body_ids{2651}, title => "Title 3", text => "Text 3" });
+    $t1->add_to_contacts($c1);
+    $t2->add_to_contacts($c2);
+    my ($problem) = $mech->create_problems_for_body(1, $body_ids{2651}, 'TITLE');
+    is $problem->response_templates, 1, 'Only the global template returned';
+    ($problem) = $mech->create_problems_for_body(1, $body_ids{2651}, 'TITLE', { category => 'Potholes' });
+    is $problem->response_templates, 2, 'Global and pothole templates returned';
+};
+
+subtest 'check duplicate reports' => sub {
+    my ($problem1, $problem2) = $mech->create_problems_for_body(2, $body_ids{2651}, 'TITLE');
+    $problem1->set_extra_metadata(duplicate_of => $problem2->id);
+    $problem1->state('duplicate');
+    $problem1->update;
+    $problem2->set_extra_metadata(duplicates => [ $problem1->id ]);
+    $problem2->update;
+
+    is $problem1->duplicate_of->title, $problem2->title, 'problem1 returns correct problem from duplicate_of';
+    is scalar @{ $problem2->duplicates }, 1, 'problem2 has correct number of duplicates';
+    is $problem2->duplicates->[0]->title, $problem1->title, 'problem2 includes problem1 in duplicates';
+};
+
+subtest 'generates a tokenised url for a user' => sub {
+    my ($problem) = $mech->create_problems_for_body(1, $body_ids{2651}, 'TITLE');
+    my $url = $problem->tokenised_url($user);
+    (my $token = $url) =~ s/\/M\///g;
+
+    like $url, qr/\/M\//, 'problem generates tokenised url';
+
+    my $token_obj = FixMyStreet::DB->resultset('Token')->find( {
+        scope => 'email_sign_in', token => $token
+    } );
+    is $token, $token_obj->token, 'token is generated in database with correct scope';
+    is $token_obj->data->{r}, $problem->url, 'token has correct redirect data';
+};
+
+subtest 'stores params in a token' => sub {
+    my ($problem) = $mech->create_problems_for_body(1, $body_ids{2651}, 'TITLE');
+    my $url = $problem->tokenised_url($user, { foo => 'bar', baz => 'boo'});
+    (my $token = $url) =~ s/\/M\///g;
+
+    my $token_obj = FixMyStreet::DB->resultset('Token')->find( {
+        scope => 'email_sign_in', token => $token
+    } );
+
+    is_deeply $token_obj->data->{p}, { foo => 'bar', baz => 'boo'}, 'token has correct params';
+};
+
+subtest 'get report time ago in appropriate format' => sub {
+    my ($problem) = $mech->create_problems_for_body(1, $body_ids{2651}, 'TITLE');
+
+    $problem->update( {
+      confirmed => DateTime->now->subtract( minutes => 2)
+    } );
+    is $problem->time_ago, '2 minutes', 'problem returns time ago in minutes';
+
+    $problem->update( {
+      confirmed => DateTime->now->subtract( hours => 18)
+    } );
+    is $problem->time_ago, '18 hours', 'problem returns time ago in hours';
+
+    $problem->update( {
+      confirmed => DateTime->now->subtract( days => 4)
+    } );
+    is $problem->time_ago, '4 days', 'problem returns time ago in days';
+
+    $problem->update( {
+      confirmed => DateTime->now->subtract( weeks => 3 )
+    } );
+    is $problem->time_ago, '3 weeks', 'problem returns time ago in weeks';
+
+    $problem->update( {
+      confirmed => DateTime->now->subtract( months => 4 )
+    } );
+    is $problem->time_ago, '4 months', 'problem returns time ago in months';
+
+    $problem->update( {
+      confirmed => DateTime->now->subtract( years => 2 )
+    } );
+    is $problem->time_ago, '2 years', 'problem returns time ago in years';
+};
+
+subtest 'time ago works with other dates' => sub {
+    my ($problem) = $mech->create_problems_for_body(1, $body_ids{2651}, 'TITLE');
+
+    $problem->update( {
+      lastupdate => DateTime->now->subtract( days => 4)
+    } );
+    is $problem->time_ago('lastupdate'), '4 days', 'problem returns last updated time ago in days';
+};
+
+subtest 'return how many days ago a problem was reported' => sub {
+    my ($problem) = $mech->create_problems_for_body(1, $body_ids{2651}, 'TITLE');
+    $problem->update( {
+      confirmed => DateTime->now->subtract( weeks => 2  )
+    } );
+    is $problem->days_ago, 14, 'days_ago returns the amount of days';
+
+    $problem->update( {
+      lastupdate => DateTime->now->subtract( days => 4)
+    } );
+
+    is $problem->days_ago('lastupdate'), 4, 'days_ago allows other dates to be specified';
+};
+
+END {
+    done_testing();
 }
-
-done_testing();

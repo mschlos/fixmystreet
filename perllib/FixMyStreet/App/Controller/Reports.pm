@@ -2,11 +2,11 @@ package FixMyStreet::App::Controller::Reports;
 use Moose;
 use namespace::autoclean;
 
-use File::Slurp;
-use List::MoreUtils qw(zip);
-use POSIX qw(strcoll);
+use JSON::MaybeXS;
+use List::MoreUtils qw(any);
+use Path::Tiny;
 use RABX;
-use mySociety::MaPit;
+use FixMyStreet::MapIt;
 
 BEGIN { extends 'Catalyst::Controller'; }
 
@@ -31,50 +31,72 @@ Show the summary page of all reports.
 sub index : Path : Args(0) {
     my ( $self, $c ) = @_;
 
-    # Zurich goes straight to map page, with all reports
-    if ( $c->cobrand->moniker eq 'zurich' ) {
-        $c->forward( 'load_and_group_problems' );
-        my $pins = $c->stash->{pins};
-        $c->stash->{page} = 'reports';
-        FixMyStreet::Map::display_map(
-            $c,
-            latitude  => @$pins ? $pins->[0]{latitude} : 0,
-            longitude => @$pins ? $pins->[0]{longitude} : 0,
-            area      => 274456,
-            pins      => $pins,
-            any_zoom  => 1,
-        );
+    if ( $c->cobrand->call_hook('report_page_data') ) {
         return 1;
     }
 
-    # Fetch all areas of the types we're interested in
-    my @bodies = $c->model('DB::Body')->all;
-    @bodies = sort { strcoll($a->name, $b->name) } @bodies;
-    $c->stash->{bodies} = \@bodies;
+    if ( my $body = $c->cobrand->all_reports_single_body ) {
+        $c->stash->{body} = $body;
+        $c->detach( 'redirect_body' );
+    }
 
-    eval {
-        my $data = File::Slurp::read_file(
-            FixMyStreet->path_to( '../data/all-reports.json' )->stringify
-        );
-        my $j = JSON->new->utf8->decode($data);
-        $c->stash->{fixed} = $j->{fixed};
-        $c->stash->{open} = $j->{open};
+    $c->forward('display_body_stats');
+
+    my $dashboard = $c->forward('load_dashboard_data');
+
+    my $table = !$c->stash->{body} && eval {
+        my $data = path(FixMyStreet->path_to('../data/all-reports.json'))->slurp_utf8;
+        $c->stash(decode_json($data));
+        return 1;
     };
-    if ($@) {
-        $c->stash->{message} = _("There was a problem showing the All Reports page. Please try again later.");
+    if (!$dashboard && !$table) {
+        $c->detach('/page_error_404_not_found') if $c->stash->{body};
+
+        my $message = _("There was a problem showing the All Reports page. Please try again later.");
         if ($c->config->{STAGING_SITE}) {
-            $c->stash->{message} .= '</p><p>Perhaps the bin/update-all-reports script needs running. Use: bin/cron-wrapper bin/update-all-reports</p><p>'
+            $message .= '</p><p>Perhaps the bin/update-all-reports script needs running. Use: bin/update-all-reports</p><p>'
                 . sprintf(_('The error was: %s'), $@);
         }
-        $c->stash->{template} = 'errors/generic.html';
-        return;
+        $c->detach('/page_error_500_internal_error', [ $message ]);
+    }
+
+    if ($c->stash->{body}) {
+        my $children = $c->stash->{body}->first_area_children;
+        unless ($children->{error}) {
+            $c->stash->{children} = $children;
+        }
+    } else {
+        my @bodies = $c->model('DB::Body')->search(undef, {
+            columns => [ "id", "name" ],
+        })->active->translated->with_area_count->all_sorted;
+        @bodies = @{$c->cobrand->call_hook('reports_hook_restrict_bodies_list', \@bodies) || \@bodies };
+        $c->stash->{bodies} = \@bodies;
     }
 
     # Down here so that error pages aren't cached.
-    $c->response->header('Cache-Control' => 'max-age=3600');
+    my $max_age = FixMyStreet->config('CACHE_TIMEOUT') // 3600;
+    $c->response->header('Cache-Control' => 'max-age=' . $max_age);
 }
 
-=head2 index
+=head2 display_body_stats
+
+Show the stats for a body if body param is set.
+
+=cut
+
+sub display_body_stats : Private {
+    my ( $self, $c ) = @_;
+    if (my $body = $c->get_param('body')) {
+        $body = $c->model('DB::Body')->find( { id => $body } );
+        if ($body) {
+            $body = $c->cobrand->short_name($body);
+            $c->res->redirect("/reports/$body");
+            $c->detach;
+        }
+    }
+}
+
+=head2 body
 
 Show the summary page for a particular body.
 
@@ -85,7 +107,7 @@ sub body : Path : Args(1) {
     $c->detach( 'ward', [ $body ] );
 }
 
-=head2 index
+=head2 ward
 
 Show the summary page for a particular ward.
 
@@ -94,47 +116,62 @@ Show the summary page for a particular ward.
 sub ward : Path : Args(2) {
     my ( $self, $c, $body, $ward ) = @_;
 
+    $c->forward('/auth/get_csrf_token');
+
+    my @wards = $c->get_param('wards') ? $c->get_param_list('wards', 1) : split /\|/, $ward || "";
     $c->forward( 'body_check', [ $body ] );
-    $c->forward( 'ward_check', [ $ward ] )
-        if $ward;
-    $c->forward( 'check_canonical_url', [ $body ] );
-    $c->forward( 'load_and_group_problems' );
+
+    # If viewing multiple wards, rewrite the url from
+    # /reports/Borsetshire?ward=North&ward=East
+    # to
+    # /reports/Borsetshire/North|East
+    my @ward_params = $c->get_param_list('ward');
+    if ( @ward_params ) {
+        $c->stash->{wards} = [ map { { name => $_ } } (@wards, @ward_params) ];
+        delete $c->req->params->{ward};
+        $c->detach("redirect_body");
+    }
 
     my $body_short = $c->cobrand->short_name( $c->stash->{body} );
+    $c->stash->{body_url} = '/reports/' . $body_short;
+
+    if ($ward && $ward eq 'summary') {
+        if (my $actual_ward = $c->get_param('ward')) {
+            $ward = $c->cobrand->short_name({ name => $actual_ward });
+            $c->res->redirect($ward);
+            $c->detach;
+        }
+        $c->cobrand->call_hook('council_dashboard_hook');
+        $c->go('index');
+    }
+
+    $c->stash->{page} = 'reports'; # So the map knows to make clickable pins
+
+    $c->forward( 'ward_check', [ @wards ] )
+        if @wards;
+    $c->forward( 'check_canonical_url', [ $body ] );
+    $c->forward( 'stash_report_filter_status' );
+    $c->forward('stash_report_sort', [ $c->cobrand->reports_ordering ]);
+    $c->forward( 'load_and_group_problems' );
+
+    $c->forward('setup_categories');
+
+    if ($c->get_param('ajax')) {
+        my $ajax_template = $c->stash->{ajax_template} || 'reports/_problem-list.html';
+        $c->detach('ajax', [ $ajax_template ]);
+    }
+
     $c->stash->{rss_url} = '/rss/reports/' . $body_short;
     $c->stash->{rss_url} .= '/' . $c->cobrand->short_name( $c->stash->{ward} )
         if $c->stash->{ward};
 
-    $c->stash->{body_url} = '/reports/' . $body_short;
-
     $c->stash->{stats} = $c->cobrand->get_report_stats();
 
-    my $pins = $c->stash->{pins};
-
-    $c->stash->{page} = 'reports'; # So the map knows to make clickable pins
-    my %map_params = (
-        latitude  => @$pins ? $pins->[0]{latitude} : 0,
-        longitude => @$pins ? $pins->[0]{longitude} : 0,
-        area      => $c->stash->{ward} ? $c->stash->{ward}->{id} : [ keys %{$c->stash->{body}->areas} ],
-        any_zoom  => 1,
-    );
-    if ( $c->cobrand->moniker eq 'emptyhomes' ) {
-        FixMyStreet::Map::display_map(
-            $c, %map_params, latitude => 0, longitude => 0,
-        );
-    } else {
-        FixMyStreet::Map::display_map(
-            $c, %map_params, pins => $pins,
-        );
-    }
-
-    $c->cobrand->tweak_all_reports_map( $c );
+    $c->forward('setup_map');
 
     # List of wards
-    if ( !$c->stash->{ward} && $c->stash->{body}->id && $c->stash->{body}->body_areas->first ) {
-        my $children = mySociety::MaPit::call('area/children', [ $c->stash->{body}->body_areas->first->area_id ],
-            type => $c->cobrand->area_types_children,
-        );
+    if ( !$c->stash->{wards} && $c->stash->{body}->id && $c->stash->{body}->body_areas->first ) {
+        my $children = $c->stash->{body}->first_area_children;
         unless ($children->{error}) {
             foreach (values %$children) {
                 $_->{url} = $c->uri_for( $c->stash->{body_url}
@@ -144,6 +181,43 @@ sub ward : Path : Args(2) {
             $c->stash->{children} = $children;
         }
     }
+}
+
+sub setup_categories :Private {
+    my ($self, $c) = @_;
+
+    my @categories = $c->stash->{body}->contacts->not_deleted->search( undef, {
+        columns => [ 'id', 'category', 'extra', 'body_id', 'send_method' ],
+        distinct => 1,
+    } )->all_sorted;
+
+    $c->cobrand->call_hook('munge_reports_category_list', \@categories);
+
+    $c->forward('/report/assigned_users_only', [ \@categories ]);
+
+    $c->stash->{filter_categories} = \@categories;
+    $c->stash->{filter_category} = { map { $_ => 1 } $c->get_param_list('filter_category', 1) };
+    $c->forward('/report/stash_category_groups', [ \@categories ]) if $c->cobrand->enable_category_groups;
+}
+
+sub setup_map :Private {
+    my ($self, $c) = @_;
+
+    my $pins = $c->stash->{pins} || [];
+
+    my $areas = [ $c->stash->{wards} ? map { $_->{id} } @{$c->stash->{wards}} : keys %{$c->stash->{body}->areas} ];
+    $c->cobrand->call_hook(munge_reports_area_list => $areas);
+    my %map_params = (
+        latitude  => @$pins ? $pins->[0]{latitude} : 0,
+        longitude => @$pins ? $pins->[0]{longitude} : 0,
+        area      => $areas,
+        any_zoom  => 1,
+    );
+    FixMyStreet::Map::display_map(
+        $c, %map_params, pins => $pins,
+    );
+
+    $c->cobrand->tweak_all_reports_map( $c );
 }
 
 sub rss_area : Path('/rss/area') : Args(1) {
@@ -165,17 +239,8 @@ sub rss_area_ward : Path('/rss/area') : Args(2) {
     # We're checking an area here, but this function is currently doing that.
     return if $c->cobrand->reports_body_check( $c, $area );
 
-    # If we're passed an ID number (don't think this is used anywhere, it
-    # certainly shouldn't be), just look that up on mapit and redirect
-    if ($area =~ /^\d+$/) {
-        my $council = mySociety::MaPit::call('area', $area);
-        $c->detach( 'redirect_index') if $council->{error};
-        $c->stash->{body} = $council;
-        $c->detach( 'redirect_body' );
-    }
-
     # We must now have a string to check on mapit
-    my $areas = mySociety::MaPit::call( 'areas', $area,
+    my $areas = FixMyStreet::MapIt::call( 'areas', $area,
         type => $c->cobrand->area_types,
     );
 
@@ -197,7 +262,7 @@ sub rss_area_ward : Path('/rss/area') : Args(2) {
     $url .= '/' . $c->cobrand->short_name( $c->stash->{ward} ) if $c->stash->{ward};
     $c->stash->{qs} = "/$url";
 
-    if ($c->stash->{area}{type} ne 'DIS' && $c->stash->{area}{type} ne 'CTY') {
+    if ($c->cobrand->moniker eq 'fixmystreet' && $c->stash->{area}{type} ne 'DIS' && $c->stash->{area}{type} ne 'CTY') {
         # UK-specific types - two possibilites are the same for one-tier councils, so redirect one to the other
         # With bodies, this should presumably redirect if only one body covers
         # the area, and then it will need that body's name (rather than
@@ -242,15 +307,13 @@ sub rss_ward : Path('/rss/reports') : Args(2) {
     if ($c->stash->{ward}) {
         # Problems sent to a council, restricted to a ward
         $c->stash->{type} = 'ward_problems';
-        $c->stash->{title_params} = { COUNCIL => $c->stash->{body}->name, WARD => $c->stash->{ward}{name} };
+        $c->stash->{title_params} = { COUNCIL => $c->stash->{body}->cobrand_name, WARD => $c->stash->{ward}{name} };
         $c->stash->{db_params} = [ $c->stash->{body}->id, $c->stash->{ward}->{id} ];
     } else {
         # Problems sent to a council
         $c->stash->{type} = 'council_problems';
-        $c->stash->{title_params} = { COUNCIL => $c->stash->{body}->name };
-        # XXX This looks up in both bodies_str and areas, but is only using body ID.
-        # This will not work properly in any install where body IDs are not === area IDs.
-        $c->stash->{db_params} = [ $c->stash->{body}->id, $c->stash->{body}->id ];
+        $c->stash->{title_params} = { COUNCIL => $c->stash->{body}->cobrand_name };
+        $c->stash->{db_params} = [ $c->stash->{body}->id ];
     }
 
     # Send on to the RSS generation
@@ -275,70 +338,182 @@ sub body_check : Private {
     # Oslo/ kommunes sharing a name in Norway
     return if $c->cobrand->reports_body_check( $c, $q_body );
 
-    # If we're passed an ID number (don't think this is used anywhere, it
-    # certainly shouldn't be), just look that up on MaPit and redirect
-    if ($q_body =~ /^\d+$/) {
-        my $area = mySociety::MaPit::call('area', $q_body);
-        $c->detach( 'redirect_index') if $area->{error};
-        $c->stash->{body} = $area;
-        $c->detach( 'redirect_body' );
-    }
-
-    # We must now have a string to check
-    my @bodies = $c->model('DB::Body')->search( { name => { -like => "$q_body%" } } )->all;
-
-    if (@bodies == 1) {
-        $c->stash->{body} = $bodies[0];
+    my $body = $c->forward('body_find', [ $q_body ]);
+    if ($body) {
+        $c->stash->{body} = $body;
         return;
-    } else {
-        foreach (@bodies) {
-            if (lc($_->name) eq lc($q_body) || $_->name =~ /^\Q$q_body\E (Borough|City|District|County) Council$/i) {
-                $c->stash->{body} = $_;
-                return;
-            }
-        }
     }
 
     # No result, bad body name.
     $c->detach( 'redirect_index' );
 }
 
+=head2
+
+Given a string, try and find a body starting with/matching that string.
+Returns the matching body object if found.
+
+=cut
+
+sub body_find : Private {
+    my ($self, $c, $q_body) = @_;
+
+    # We must now have a string to check
+    my @bodies = $c->model('DB::Body')->search( { name => { -like => "$q_body%" } } )->all;
+
+    if (@bodies == 1) {
+        return $bodies[0];
+    } else {
+        foreach (@bodies) {
+            if (lc($_->name) eq lc($q_body) || $_->name =~ /^\Q$q_body\E (Borough|City|District|County) Council$/i) {
+                return $_;
+            }
+        }
+    }
+
+    my @translations = $c->model('DB::Translation')->search( {
+        tbl => 'body',
+        col => 'name',
+        msgstr => $q_body
+    } )->all;
+
+    if (@translations == 1) {
+        if ( my $body = $c->model('DB::Body')->find( { id => $translations[0]->object_id } ) ) {
+            return $body;
+        }
+    }
+}
+
 =head2 ward_check
 
-This action checks the ward name from a URI exists and is part of the right
+This action checks the ward names from a URI exists and are part of the right
 parent, already found with body_check. It either stores the ward Area if
 okay, or redirects to the body page if bad.
 
 =cut
 
 sub ward_check : Private {
-    my ( $self, $c, $ward ) = @_;
+    my ( $self, $c, @wards ) = @_;
 
-    $ward =~ s/\+/ /g;
-    $ward =~ s/\.html//;
-    $ward =~ s{_}{/}g;
+    foreach (@wards) {
+        s/\+/ /g;
+        s/\.html//;
+        s{_}{/}g;
+    }
 
     # Could be from RSS area, or body...
     my $parent_id;
     if ( $c->stash->{body} ) {
-        $parent_id = $c->stash->{body}->body_areas->first->area_id;
+        $parent_id = $c->stash->{body}->body_areas->first;
+        $c->detach( 'redirect_body' ) unless $parent_id;
+        $parent_id = $parent_id->area_id;
     } else {
         $parent_id = $c->stash->{area}->{id};
     }
 
-    my $qw = mySociety::MaPit::call('areas', $ward,
-        type => $c->cobrand->area_types_children,
-    );
+    my $qw = $c->cobrand->fetch_area_children($parent_id);
+    my %names = map { $c->cobrand->short_name({ name => $_ }) => 1 } @wards;
+    my @areas;
     foreach my $area (sort { $a->{name} cmp $b->{name} } values %$qw) {
-        if ($area->{parent_area} == $parent_id) {
-            $c->stash->{ward} = $area;
-            return;
-        }
+        my $name = $c->cobrand->short_name($area);
+        push @areas, $area if $names{$name};
     }
+    if (@areas) {
+        $c->stash->{ward} = $areas[0] if @areas == 1;
+        $c->stash->{wards} = \@areas;
+        return;
+    }
+
     # Given a false ward name
     $c->stash->{body} = $c->stash->{area}
         unless $c->stash->{body};
     $c->detach( 'redirect_body' );
+}
+
+=head2 summary
+
+This is the summary page used on fixmystreet.com
+
+=cut
+
+sub summary : Private {
+    my ($self, $c) = @_;
+    my $dashboard = $c->forward('load_dashboard_data');
+
+    $c->log->info($c->user->email . ' viewed ' . $c->req->uri->path_query) if $c->user_exists;
+
+    eval {
+        my $data = path(FixMyStreet->path_to('../data/all-reports-dashboard.json'))->slurp_utf8;
+        $data = decode_json($data);
+        $c->stash(
+            top_five_bodies => $data->{top_five_bodies},
+            average => $data->{average},
+        );
+    };
+
+    my $dtf = $c->model('DB')->storage->datetime_parser;
+    my $period = $c->stash->{period} = $c->get_param('period') || '';
+    my $start_date;
+    if ($period eq 'ever') {
+        $start_date = DateTime->new(year => 2007);
+    } elsif ($period eq 'year') {
+        $start_date = DateTime->now->subtract(years => 1);
+    } elsif ($period eq '3months') {
+        $start_date = DateTime->now->subtract(months => 3);
+    } elsif ($period eq 'week') {
+        $start_date = DateTime->now->subtract(weeks => 1);
+    } else {
+        $c->stash->{period} = 'month';
+        $start_date = DateTime->now->subtract(months => 1);
+    }
+
+    # required to stop errors in generate_grouped_data
+    $c->stash->{q_state} = '';
+    $c->stash->{ward} = [ $c->get_param('area') || () ];
+    $c->stash->{start_date} = $dtf->format_date($start_date);
+    $c->stash->{end_date} = $c->get_param('end_date');
+
+    $c->stash->{group_by_default} = 'category';
+
+    my $children = $c->stash->{body}->first_area_children;
+    $c->stash->{children} = $children;
+
+    $c->forward('/admin/fetch_contacts');
+    $c->stash->{contacts} = [ $c->stash->{contacts}->all ];
+
+    my $reporting = $c->forward('/dashboard/construct_rs_filter', []);
+
+    if ( $c->get_param('csv') ) {
+        $c->detach('export_summary_csv', [ $reporting ]);
+    }
+
+    $c->forward('/dashboard/generate_grouped_data');
+    $c->forward('/dashboard/generate_body_response_time');
+
+    $c->stash->{template} = 'reports/summary.html';
+}
+
+sub export_summary_csv : Private {
+    my ( $self, $c, $reporting ) = @_;
+
+    $reporting->objects_attrs({
+        rows => 100,
+        order_by => { '-desc' => 'me.confirmed' },
+    });
+    $reporting->add_csv_columns(
+        id => 'Report ID',
+        title => 'Title',
+        category => 'Category',
+        created => 'Created',
+        confirmed => 'Confirmed',
+        state => 'Status',
+        latitude => 'Latitude',
+        longitude => 'Longitude',
+        postcode => 'Query',
+        url => 'Report URL',
+    );
+    $reporting->filename('fixmystreet-data');
+    $reporting->generate_csv_http($c);
 }
 
 =head2 check_canonical_url
@@ -357,66 +532,59 @@ sub check_canonical_url : Private {
     $c->detach( 'redirect_body' ) unless $body_short eq $url_short;
 }
 
+sub load_dashboard_data : Private {
+    my ($self, $c) = @_;
+    my $dashboard = eval {
+        my $data = FixMyStreet->config('TEST_DASHBOARD_DATA');
+        # uncoverable branch true
+        unless ($data) {
+            my $fn = '../data/all-reports-dashboard';
+            if ($c->stash->{body}) {
+                $fn .= '-' . $c->stash->{body}->id;
+            }
+            $data = decode_json(path(FixMyStreet->path_to($fn . '.json'))->slurp_utf8);
+        }
+        $c->stash($data);
+        return 1;
+    };
+
+    return $dashboard;
+}
+
 sub load_and_group_problems : Private {
     my ( $self, $c ) = @_;
 
-    my $page = $c->req->params->{p} || 1;
+    my $parameters = $c->forward('load_problems_parameters');
 
-    my $where = {
-        non_public => 0,
-        state      => [ FixMyStreet::DB::Result::Problem->visible_states() ]
-    };
-    if ($c->stash->{ward}) {
-        $where->{areas} = { 'like', '%,' . $c->stash->{ward}->{id} . ',%' };
-        $where->{bodies_str} = [
-            undef,
-            $c->stash->{body}->id,
-            { 'like', $c->stash->{body}->id . ',%' },
-            { 'like', '%,' . $c->stash->{body}->id },
-        ];
-    } elsif ($c->stash->{body}) {
-        # XXX FixMyStreet used to have the following line so that reports not
-        # currently sent anywhere could still be listed in the appropriate
-        # (body/area), as they were the same.  Now they're not, not sure if
-        # there's a way to do this easily.
-        #$where->{areas} = { 'like', '%,' . $c->stash->{body}->id . ',%' };
-        $where->{bodies_str} = [
-        #    undef,
-            $c->stash->{body}->id,
-            { 'like', $c->stash->{body}->id . ',%' },
-            { 'like', '%,' . $c->stash->{body}->id },
-        ];
+    my $body = $c->stash->{body}; # Might be undef
+    my $page = $c->get_param('p') || 1;
+
+    my $problems = $c->cobrand->problems;
+    my $where = $parameters->{where};
+    my $filter = $parameters->{filter};
+
+    if ($where->{areas} || $body) {
+        $problems = $problems->to_body($body);
     }
-    my $problems = $c->cobrand->problems->search(
+
+    $problems = $problems->search(
         $where,
-        {
-            order_by => { -desc => 'lastupdate' },
-            rows => $c->cobrand->reports_per_page,
-        }
-    )->page( $page );
+        $filter
+    )->include_comment_counts->page( $page );
+
     $c->stash->{pager} = $problems->pager;
 
     my ( %problems, @pins );
     while ( my $problem = $problems->next ) {
-        $c->log->debug( $problem->cobrand . ', cobrand is ' . $c->cobrand->moniker );
-        if ( !$c->stash->{body} ) {
+        if ( !$body ) {
             add_row( $c, $problem, 0, \%problems, \@pins );
             next;
         }
-        if ( !$problem->bodies_str ) {
-            # Problem was not sent to any body, add to all possible areas XXX
-            my $a = $problem->areas; # Store, as otherwise is looked up every iteration.
-            while ($a =~ /,(\d+)(?=,)/g) {
-                add_row( $c, $problem, $1, \%problems, \@pins );
-            }
-        } else {
-            # Add to bodies it was sent to
-            # XXX Assumes body ID matches "council ID"
-            my $bodies = $problem->bodies_str_ids;
-            foreach ( @$bodies ) {
-                next if $_ != $c->stash->{body}->id;
-                add_row( $c, $problem, $_, \%problems, \@pins );
-            }
+        # Add to bodies it was sent to
+        my $bodies = $problem->bodies_str_ids;
+        foreach ( @$bodies ) {
+            next if $_ != $body->id;
+            add_row( $c, $problem, $_, \%problems, \@pins );
         }
     }
 
@@ -426,6 +594,105 @@ sub load_and_group_problems : Private {
     );
 
     return 1;
+}
+
+sub load_problems_parameters : Private {
+    my ($self, $c) = @_;
+
+    my $category = [ $c->get_param_list('filter_category', 1) ];
+
+    my $states = $c->stash->{filter_problem_states};
+    my $where = {
+        'me.state' => [ keys %$states ]
+    };
+
+    $c->forward('check_non_public_reports_permission', [ $where ] );
+
+    my $body = $c->stash->{body}; # Might be undef
+
+    my $filter = {
+        order_by => [ $c->stash->{sort_order}, { -desc => 'me.id' } ],
+        rows => $c->cobrand->reports_per_page,
+    };
+    if ($c->user_exists && $body) {
+        my $prefetch = [];
+        if ($c->user->from_body || $c->user->is_superuser) {
+            push @$prefetch, 'contact';
+        }
+        if ($c->user->has_permission_to('planned_reports', $body->id)) {
+            push @$prefetch, 'user_planned_reports';
+        }
+        if ($c->user->has_permission_to('report_edit_priority', $body->id) || $c->user->has_permission_to('report_inspect', $body->id)) {
+            push @$prefetch, 'response_priority';
+        }
+        $prefetch = $prefetch->[0] if @$prefetch == 1;
+        $filter->{prefetch} = $prefetch;
+    }
+
+    if (defined $c->stash->{filter_status}{shortlisted}) {
+        $where->{'me.id'} = { '=', \"user_planned_reports.report_id"};
+        $where->{'user_planned_reports.removed'} = undef;
+        $filter->{join} = 'user_planned_reports';
+    } elsif (defined $c->stash->{filter_status}{unshortlisted}) {
+        my $shortlisted_ids = $c->cobrand->problems->search({
+            'me.id' => { '=', \"user_planned_reports.report_id"},
+            'user_planned_reports.removed' => undef,
+        }, {
+           join => 'user_planned_reports',
+           columns => ['me.id'],
+        })->as_query;
+        $where->{'me.id'} = { -not_in => $shortlisted_ids };
+    }
+
+    if (@$category) {
+        $where->{'me.category'} = $category;
+    }
+
+    if ($c->stash->{wards}) {
+        $where->{areas} = [
+            map { { 'like', '%,' . $_->{id} . ',%' } } @{$c->stash->{wards}}
+        ];
+    }
+
+    if (my $bbox = $c->get_param('bbox')) {
+        my ($min_lon, $min_lat, $max_lon, $max_lat) = split /,/, $bbox;
+        $where->{latitude} = { '>=', $min_lat, '<', $max_lat };
+        $where->{longitude} = { '>=', $min_lon, '<', $max_lon };
+    }
+
+    $c->cobrand->call_hook('munge_load_and_group_problems', $where, $filter);
+
+    return {
+        where => $where,
+        filter => $filter,
+    };
+}
+
+sub check_non_public_reports_permission : Private {
+    my ($self, $c, $where) = @_;
+
+    if ( $c->user_exists ) {
+        my $user_has_permission;
+
+        if ( $c->user->is_superuser ) {
+            $user_has_permission = 1;
+        } else {
+            my $body = $c->stash->{body};
+
+            $user_has_permission = $body && (
+                $c->user->has_permission_to('report_inspect', $body->id) ||
+                $c->user->has_permission_to('report_mark_private', $body->id)
+            );
+        }
+
+        if ( $user_has_permission ) {
+            $where->{'me.non_public'} = 1 if $c->stash->{only_non_public};
+        } else {
+            $where->{'me.non_public'} = 0;
+        }
+    } else {
+        $where->{'me.non_public'} = 0;
+    }
 }
 
 sub redirect_index : Private {
@@ -440,21 +707,147 @@ sub redirect_body : Private {
     $url   .= "/rss" if $c->stash->{rss};
     $url   .= '/reports';
     $url   .= '/' . $c->cobrand->short_name( $c->stash->{body} );
-    $url   .= '/' . $c->cobrand->short_name( $c->stash->{ward} )
-        if $c->stash->{ward};
-    $c->res->redirect( $c->uri_for($url) );
+    $url   .= '/' . join('|', map { $c->cobrand->short_name($_) } @{$c->stash->{wards}})
+        if $c->stash->{wards};
+    $c->res->redirect( $c->uri_for($url, $c->req->params ) );
+}
+
+sub stash_report_filter_status : Private {
+    my ( $self, $c ) = @_;
+
+    my @status = $c->get_param_list('status', 1);
+    @status = ($c->stash->{page} eq 'my' ? 'all' : $c->cobrand->on_map_default_status) unless @status;
+    $c->cobrand->call_hook(hook_report_filter_status => \@status);
+
+    my %status = map { $_ => 1 } @status;
+    my %filter_problem_states;
+    my %filter_status;
+
+    if ($status{open}) {
+        my $s = FixMyStreet::DB::Result::Problem->open_states();
+        %filter_problem_states = (%filter_problem_states, %$s);
+        $filter_status{open} = 1;
+        $filter_status{$_} = 1 for keys %$s;
+    }
+    if ($status{closed}) {
+        my $s = FixMyStreet::DB::Result::Problem->closed_states();
+        %filter_problem_states = (%filter_problem_states, %$s);
+        $filter_status{closed} = 1;
+        $filter_status{$_} = 1 for keys %$s;
+    }
+    if ($status{fixed}) {
+        my $s = FixMyStreet::DB::Result::Problem->fixed_states();
+        %filter_problem_states = (%filter_problem_states, %$s);
+        $filter_status{fixed} = 1;
+        $filter_status{$_} = 1 for keys %$s;
+    }
+
+    if ($status{all}) {
+        my $s = FixMyStreet::DB::Result::Problem->visible_states();
+        # %filter_status = ();
+        %filter_problem_states = %$s;
+    }
+
+    if ($status{shortlisted}) {
+        $filter_status{shortlisted} = 1;
+    }
+
+    if ($status{unshortlisted}) {
+        $filter_status{unshortlisted} = 1;
+    }
+
+    my $body_user = $c->user_exists && $c->stash->{body} && $c->user->belongs_to_body($c->stash->{body}->id);
+    my $staff_user = $c->user_exists && ($c->user->is_superuser || $body_user);
+    if ($staff_user || $c->cobrand->call_hook('filter_show_all_states')) {
+        $c->stash->{filter_states} = $c->cobrand->state_groups_inspect;
+        foreach my $state (FixMyStreet::DB::Result::Problem->visible_states()) {
+            if ($status{$state}) {
+                $filter_problem_states{$state} = 1;
+                $filter_status{$state} = 1;
+            }
+        }
+    }
+
+    if ($status{non_public}) {
+        $c->stash->{only_non_public} = 1;
+    }
+
+    if (keys %filter_problem_states == 0) {
+      my $s = FixMyStreet::DB::Result::Problem->open_states();
+      %filter_problem_states = (%filter_problem_states, %$s);
+    }
+
+    $c->stash->{filter_problem_states} = \%filter_problem_states;
+    $c->stash->{filter_status} = \%filter_status;
+    return 1;
+}
+
+sub stash_report_sort : Private {
+    my ( $self, $c, $default ) = @_;
+
+    my %types = (
+        updated => 'lastupdate',
+        created => 'confirmed',
+        comments => 'comment_count',
+    );
+    $types{created} = 'created' if $c->cobrand->moniker eq 'zurich';
+
+    my $sort = $c->get_param('sort') || $default;
+    $sort = $default unless $sort =~ /^((updated|created)-(desc|asc)|comments-desc|shortlist)$/;
+    $c->stash->{sort_key} = $sort;
+
+    # Going to do this sorting code-side
+    $sort = 'created-desc' if $sort eq 'shortlist';
+
+    $sort =~ /^(updated|created|comments)-(desc|asc)$/;
+    my $order_by = $types{$1} || $1;
+    # field to use for report age cutoff
+    $c->stash->{report_age_field} = $order_by eq 'comment_count' ? 'lastupdate' : $order_by;
+    my $dir = $2;
+    $order_by = { -desc => $order_by } if $dir eq 'desc';
+
+    $c->stash->{sort_order} = $order_by;
+
+    return 1;
 }
 
 sub add_row {
     my ( $c, $problem, $body, $problems, $pins ) = @_;
     push @{$problems->{$body}}, $problem;
-    push @$pins, {
-        latitude  => $problem->latitude,
-        longitude => $problem->longitude,
-        colour    => $c->cobrand->pin_colour( $problem, 'reports' ),
-        id        => $problem->id,
-        title     => $problem->title_safe,
+    push @$pins, $problem->pin_data('reports');
+}
+
+sub ajax : Private {
+    my ($self, $c, $template) = @_;
+
+    $c->res->content_type('application/json; charset=utf-8');
+    $c->res->header( 'Cache_Control' => 'max-age=0' );
+
+    my @pins = map {
+        my $p = $_;
+        # lat, lon, 'colour', ID, title, type/size, draggable
+        my $parts = [ $p->{latitude}, $p->{longitude}, $p->{colour}, $p->{id}, $p->{title}, '', JSON->false ];
+        # Some reports may only be visible on a specific cobrand on this FMS site.
+        # If that's the case, include the base URL for the pin's cobrand here so
+        # the app can link to the right place.
+        push @$parts, $p->{base_url} if $p->{base_url};
+        $parts;
+    } @{$c->stash->{pins}};
+
+    my $list_html = $c->render_fragment($template);
+
+    my $pagination = $c->render_fragment('pagination.html', {
+        pager => $c->stash->{problems_pager} || $c->stash->{pager},
+        param => 'p',
+    });
+
+    my $json = {
+        pins => \@pins,
+        pagination => $pagination,
     };
+    $json->{reports_list} = $list_html if $list_html;
+    my $body = encode_json($json);
+    $c->res->body($body);
 }
 
 =head1 AUTHOR
@@ -471,4 +864,3 @@ Licensed under the Affero GPL.
 __PACKAGE__->meta->make_immutable;
 
 1;
-

@@ -1,12 +1,22 @@
-Subject: New problems in <?=$values['area_name']?> on FixMyStreet
+Subject: New [% site_name %] reports in [% area_name %]
 
-The following new problems have been added within
-<?=$values['area_name']?>:
+The following new [% site_name %] reports have been added in
+the [% area_name %] area:
 
-<?=$values['data']?>
+[% INCLUDE '_email_report_list.txt' %]
 
-<?=$values['signature']?>
+[% signature %]
 
-To stop receiving emails when there are new problems in
-<?=$values['area_name']?>, please follow this link: 
-<?=$values['unsubscribe_url']?>
+
+Unsubscribe?
+
+You asked us to send you an email when someone makes a new [% site_name %]
+report in [% area_name %]. This is a free service from [% site_name %].
+
+If you no longer wish to receive an email whenever there are new reports in
+the [% area_name %] area, please follow this link:
+
+[% unsubscribe_url %]
+
+This email was sent automatically, from an unmonitored email account - so please
+do not reply to it.

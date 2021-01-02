@@ -1,35 +1,24 @@
-#!/usr/bin/perl
-
-use strict;
-use warnings;
-use Test::More;
-use FixMyStreet::App;
+use FixMyStreet::DB;
 use FixMyStreet::Map;
 use FixMyStreet::TestMech;
 use DateTime;
-use mySociety::Locale;
+
+use Catalyst::Test 'FixMyStreet::App';
 
 my $mech = FixMyStreet::TestMech->new;
 
-mySociety::Locale::gettext_domain('FixMyStreet');
-
 FixMyStreet::Map::set_map_class();
-my $r = Catalyst::Request->new( { base => URI->new('/'), uri => URI->new('http://fixmystreet.com/test'), parameters => { bbox => '-7.6,49.7,-7.5,49.8' } } );
+my $c = ctx_request('http://fixmystreet.com/test?bbox=-7.6,49.7,-7.5,49.8');
 
-my $c = FixMyStreet::App->new( {
-    request => $r,
-});
-
-$mech->delete_user('test@example.com');
 my $user =
-  FixMyStreet::App->model('DB::User')
+  FixMyStreet::DB->resultset('User')
   ->find_or_create( { email => 'test@example.com', name => 'Test User' } );
 ok $user, "created test user";
 
 my $dt = DateTime->now();
 
 
-my $report = FixMyStreet::App->model('DB::Problem')->find_or_create(
+my $report = FixMyStreet::DB->resultset('Problem')->find_or_create(
     {
         postcode           => 'SW1A 1AA',
         bodies_str         => '2504',
@@ -102,23 +91,19 @@ for my $test (
     subtest "pin colour for state $test->{state}" => sub {
         $report->state($test->{state});
         $report->update;
+        $c->stash->{report_age_field} = 'lastupdate';
 
-        my ( $pins, $around_map_list, $nearby, $dist ) =
-            FixMyStreet::Map::map_pins( $c, 0, 0, 0, 0 );
+        my ($on_map, $nearby) = FixMyStreet::Map::map_features($c, bbox => "0,0,0,0");
 
-        ok $pins;
-        ok $around_map_list;
+        ok $on_map;
         ok $nearby;
-        ok $dist;
 
         my $id = $report->id;
         my $colour = $test->{colour};
 
-        is $pins->[0][2], $colour, 'pin colour';
+        my $pin_colour = $c->cobrand->pin_colour($on_map->[0], 'around');
+        is $pin_colour, $colour, 'pin colour';
     };
 }
-
-$mech->delete_user( $user );
-
 
 done_testing();

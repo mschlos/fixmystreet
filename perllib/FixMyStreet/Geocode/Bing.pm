@@ -1,5 +1,3 @@
-#!/usr/bin/perl
-#
 # FixMyStreet::Geocode::Bing
 # Geocoding with Bing for FixMyStreet.
 #
@@ -9,13 +7,16 @@
 package FixMyStreet::Geocode::Bing;
 
 use strict;
-use Encode;
-use File::Slurp;
-use File::Path ();
-use LWP::Simple;
-use Digest::MD5 qw(md5_hex);
+use warnings;
 
-use mySociety::Locale;
+use FixMyStreet::Geocode;
+use Utils;
+
+sub setup {
+    my $cls = shift;
+    return 1 if FixMyStreet->config('BING_MAPS_API_KEY');
+    return 0;
+}
 
 # string STRING CONTEXT
 # Looks up on Bing Maps API, and caches, a user-inputted location.
@@ -23,9 +24,11 @@ use mySociety::Locale;
 # an array of matches if there are more than one. The information in the query
 # may be used to disambiguate the location in cobranded versions of the site.
 sub string {
-    my ( $s, $c ) = @_;
+    my ( $cls, $s, $c ) = @_;
 
     my $params = $c->cobrand->disambiguate_location($s);
+    # Allow cobrand to fixup the user input
+    $s = $params->{string} if $params->{string};
 
     $s = FixMyStreet::Geocode::escape($s);
     $s .= '+' . $params->{town} if $params->{town} and $s !~ /$params->{town}/i;
@@ -34,26 +37,15 @@ sub string {
     $url .= '&userMapView=' . join(',', @{$params->{bounds}})
         if $params->{bounds};
     $url .= '&userLocation=' . $params->{centre} if $params->{centre};
+    $url .= '&userIp=127.0.0.1'; # So server location does not affect results
+    $url .= '&maxResults=10'; # Match what is said in the front end
     $url .= '&c=' . $params->{bing_culture} if $params->{bing_culture};
 
-    my $cache_dir = FixMyStreet->config('GEO_CACHE') . 'bing/';
-    my $cache_file = $cache_dir . md5_hex($url);
-    my $js;
-    if (-s $cache_file) {
-        $js = File::Slurp::read_file($cache_file);
-    } else {
-        $url .= '&key=' . FixMyStreet->config('BING_MAPS_API_KEY');
-        $js = LWP::Simple::get($url);
-        $js = encode_utf8($js) if utf8::is_utf8($js);
-        File::Path::mkpath($cache_dir);
-        File::Slurp::write_file($cache_file, $js) if $js;
-    }
-
+    $c->stash->{geocoder_url} = $url;
+    my $js = FixMyStreet::Geocode::cache('bing', $url, 'key=' . FixMyStreet->config('BING_MAPS_API_KEY'));
     if (!$js) {
         return { error => _('Sorry, we could not parse that location. Please try again.') };
     }
-
-    $js = JSON->new->utf8->allow_nonref->decode($js);
     if ($js->{statusCode} ne '200') {
         return { error => _('Sorry, we could not find that location.') };
     }
@@ -61,9 +53,28 @@ sub string {
     my $results = $js->{resourceSets}->[0]->{resources};
     my ( $error, @valid_locations, $latitude, $longitude );
 
+    # If there are any High/Medium confidence results, don't include Low ones
+    my $exclude_low;
+    foreach (@$results) {
+        my $confidence = $_->{confidence};
+        if ($confidence eq 'High' || $confidence eq 'Medium') {
+            $exclude_low = 1;
+            last;
+        }
+    }
+    if ($exclude_low) {
+        @$results = grep { $_->{confidence} ne 'Low' } @$results;
+    }
+
     foreach (@$results) {
         my $address = $_->{name};
-        next if $params->{bing_country} && $_->{address}->{countryRegion} ne $params->{bing_country};
+        if ($params->{bing_country}) {
+            next if $_->{address}->{countryRegion} ne $params->{bing_country};
+            $address =~ s/, $params->{bing_country}$//;
+        }
+        if ($address !~ /$_->{address}->{locality}/) {
+            $address .= ", $_->{address}->{locality}";
+        }
 
         # Getting duplicate, yet different, results from Bing sometimes
         next if @valid_locations
@@ -73,15 +84,14 @@ sub string {
                 || $valid_locations[-1]{address}{locality} eq $_->{address}{locality}
                );
 
-        ( $latitude, $longitude ) = @{ $_->{point}->{coordinates} };
-        # These co-ordinates are output as query parameters in a URL, make sure they have a "."
-        mySociety::Locale::in_gb_locale {
-            push (@$error, {
-                address => $address,
-                latitude => sprintf('%0.6f', $latitude),
-                longitude => sprintf('%0.6f', $longitude)
-            });
-        };
+        ( $latitude, $longitude ) =
+            map { Utils::truncate_coordinate($_) }
+            @{ $_->{point}->{coordinates} };
+        push (@$error, {
+            address => $address,
+            latitude => $latitude,
+            longitude => $longitude
+        });
         push (@valid_locations, $_);
     }
 
@@ -90,33 +100,15 @@ sub string {
 }
 
 sub reverse {
-    my ( $latitude, $longitude, $bing_culture, $cache ) = @_;
+    my ( $latitude, $longitude, $bing_culture ) = @_;
 
     # Get nearest road-type thing from Bing
-    my $key = mySociety::Config::get('BING_MAPS_API_KEY', '');
+    my $key = FixMyStreet->config('BING_MAPS_API_KEY', '');
     if ($key) {
         my $url = "http://dev.virtualearth.net/REST/v1/Locations/$latitude,$longitude?key=$key";
         $url .= '&c=' . $bing_culture if $bing_culture;
-        my $j;
-        if ( $cache ) {
-            my $cache_dir = FixMyStreet->config('GEO_CACHE') . 'bing/';
-            my $cache_file = $cache_dir . md5_hex($url);
-
-            if (-s $cache_file) {
-                $j = File::Slurp::read_file($cache_file);
-            } else {
-                $j = LWP::Simple::get($url);
-                File::Path::mkpath($cache_dir);
-                File::Slurp::write_file($cache_file, $j) if $j;
-            }
-        } else {
-            $j = LWP::Simple::get($url);
-        }
-
-        if ($j) {
-            $j = JSON->new->utf8->allow_nonref->decode($j);
-            return $j;
-        }
+        my $j = FixMyStreet::Geocode::cache('bing', $url);
+        return $j if $j;
     }
 
     return undef;

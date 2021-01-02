@@ -10,13 +10,29 @@ use strict;
 use warnings;
 require 5.8.0;
 
-use CGI; # XXX
+BEGIN {
+    use File::Basename qw(dirname);
+    use File::Spec;
+    my $d = dirname(File::Spec->rel2abs($0));
+    require "$d/../setenv.pl";
+}
+
+use Getopt::Long::Descriptive;
 use CronFns;
 
-use mySociety::Config;
-use FixMyStreet::App;
+use FixMyStreet;
+use FixMyStreet::Script::Reports;
 
-my $site = CronFns::site(mySociety::Config::get('BASE_URL'));
+my $site = CronFns::site(FixMyStreet->config('BASE_URL'));
 CronFns::language($site);
 
-FixMyStreet::App->model('DB::Problem')->send_reports();
+my ($opts, $usage) = describe_options(
+    '%c %o',
+    ['verbose|v', 'more verbose output'],
+    ['nomail', 'do not send any email, print instead'],
+    ['debug', 'always try and send reports (no back-off skipping)'],
+    ['help|h', "print usage message and exit" ],
+);
+$usage->die if $opts->help;
+
+FixMyStreet::Script::Reports::send($opts->verbose, $opts->nomail, $opts->debug);

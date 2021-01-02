@@ -8,16 +8,11 @@ use Carp;
 use mySociety::MaPit;
 use FixMyStreet::Geocode::OSM;
 
-sub path_to_web_templates {
-    my $self = shift;
-    return [ FixMyStreet->path_to( 'templates/web', $self->moniker )->stringify ];
-}
-
 sub country {
     return 'NO';
 }
 
-sub languages { [ 'en-gb,English,en_GB', 'nb,Norwegian,nb_NO' ] }
+sub languages { [ 'nb,Norwegian,nb_NO' ] }
 sub language_override { 'nb' }
 
 sub enter_postcode_text {
@@ -34,22 +29,9 @@ sub disambiguate_location {
 }
 
 sub area_types {
+    my $self = shift;
+    return $self->next::method() if FixMyStreet->staging_flag('skip_checks');
     [ 'NKO', 'NFY', 'NRA' ];
-}
-
-sub admin_base_url {
-    return 'http://www.fiksgatami.no/admin/';
-}
-
-# If lat/lon are present in the URL, OpenLayers will use that to centre the map.
-# Need to specify a zoom to stop it defaulting to null/0.
-sub uri {
-    my ( $self, $uri ) = @_;
-
-    $uri->query_param( zoom => 3 )
-      if $uri->query_param('lat') && !$uri->query_param('zoom');
-
-    return $uri;
 }
 
 sub geocode_postcode {
@@ -79,8 +61,9 @@ sub geocoded_string_check {
 }
 
 sub find_closest {
-    my ( $self, $latitude, $longitude ) = @_;
-    return FixMyStreet::Geocode::OSM::closest_road_text( $self, $latitude, $longitude );
+    my ( $self, $problem ) = @_;
+    $problem = $problem->{problem} if ref $problem eq 'HASH';
+    return FixMyStreet::Geocode::OSM::closest_road_text( $self, $problem->latitude, $problem->longitude );
 }
 
 # Used by send-reports, calling find_closest, calling OSM geocoding
@@ -142,6 +125,9 @@ sub council_rss_alert_options {
         }
     }
 
+    my $body_kommune = FixMyStreet::DB->resultset('Body')->for_areas($kommune->{id})->first;
+    my $body_fylke = FixMyStreet::DB->resultset('Body')->for_areas($fylke->{id})->first;
+
     if ( $fylke->{id} == 3 ) {    # Oslo
         my $short_name = $self->short_name($fylke, $all_councils);
         ( my $id_name = $short_name ) =~ tr/+/_/;
@@ -149,7 +135,7 @@ sub council_rss_alert_options {
         push @options,
           {
             type => 'council',
-            id   => sprintf( 'council:%s:%s', $fylke->{id}, $id_name ),
+            id   => sprintf( 'council:%s:%s', $body_fylke->id, $id_name ),
             rss_text =>
               sprintf( _('RSS feed of problems within %s'), $fylke->{name} ),
             text => sprintf( _('Problems within %s'), $fylke->{name} ),
@@ -184,7 +170,7 @@ sub council_rss_alert_options {
         push @reported_to_options,
           {
             type => 'council',
-            id => sprintf( 'council:%s:%s', $kommune->{id}, $id_kommune_name ),
+            id => sprintf( 'council:%s:%s', $body_kommune->id, $id_kommune_name ),
             rss_text =>
               sprintf( _('RSS feed of %s'), $kommune->{name} ),
             text => $kommune->{name},
@@ -192,11 +178,11 @@ sub council_rss_alert_options {
           },
           {
             type => 'council',
-            id   => sprintf( 'council:%s:%s', $fylke->{id}, $id_fylke_name ),
+            id   => sprintf( 'council:%s:%s', $body_fylke->id, $id_fylke_name ),
             rss_text =>
               sprintf( _('RSS feed of %s'), $fylke->{name} ),
             text => $fylke->{name},
-            uri => $c->uri_for( '/rss/reports/', $short_fylke_name ),
+            uri => $c->uri_for( '/rss/reports', $short_fylke_name ),
           };
     }
 
@@ -237,6 +223,10 @@ sub reports_body_check {
         $c->detach( 'redirect_index' );
 
     }
+}
+
+sub jurisdiction_id_example {
+    'fiksgatami.no';
 }
 
 1;

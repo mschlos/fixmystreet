@@ -1,12 +1,24 @@
-Subject: New problems reported to <?=$values['area_name']?> within <?=$values['ward_name']?> on FixMyStreet
+Subject: New [% site_name %] reports to [% area_name %] within [% ward_name %]
 
-The following new problems have been reported to <?=$values['area_name']?>
-within <?=$values['ward_name']?>:
+The following new [% site_name %] reports have been sent to [% area_name %]
+within [% ward_name %]:
 
-<?=$values['data']?>
+[% INCLUDE '_email_report_list.txt' %]
 
-<?=$values['signature']?>
+[% signature %]
 
-To stop receiving emails when there are new problems reported to
-<?=$values['area_name']?> within <?=$values['ward_name']?>,
-please follow this link: <?=$values['unsubscribe_url']?>
+
+Unsubscribe?
+
+You subscribed to receive an email every time someone makes a new [% site_name %]
+report to [% area_name %] within [% ward_name %]. This is a
+free service from [% site_name %].
+
+If you no longer wish to receive an email whenever there are new reports to
+[% area_name %] within [% ward_name %], please follow
+this link:
+
+[% unsubscribe_url %]
+
+This email was sent automatically, from an unmonitored email account - so please
+do not reply to it.

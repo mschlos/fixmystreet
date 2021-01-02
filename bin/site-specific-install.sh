@@ -1,5 +1,8 @@
 #!/bin/sh
 
+# Set this to the version we want to check out
+VERSION=${VERSION_OVERRIDE:-v3.1}
+
 PARENT_SCRIPT_URL=https://github.com/mysociety/commonlib/blob/master/bin/install-site.sh
 
 misuse() {
@@ -22,20 +25,45 @@ misuse() {
 [ -z "$HOST" ] && misuse HOST
 [ -z "$DISTRIBUTION" ] && misuse DISTRIBUTION
 [ -z "$VERSION" ] && misuse VERSION
+[ -z "$DEVELOPMENT_INSTALL" ] && misuse DEVELOPMENT_INSTALL
+[ -z "$DOCKER" ] && misuse DOCKER
+[ -z "$INSTALL_DB" ] && misuse INSTALL_DB
+[ -z "$INSTALL_POSTFIX" ] && misuse INSTALL_POSTFIX
 
-install_nginx
+add_locale cy_GB
+add_locale sv_SE
+add_locale de_CH
+
+if [ $INSTALL_POSTFIX = true ]; then
+    install_postfix
+fi
+
+if [ ! "$DEVELOPMENT_INSTALL" = true ]; then
+    if [ ! "$DOCKER" = true ]; then
+      install_nginx
+      add_website_to_nginx
+    fi
+    # Check out the current released version
+    su -l -c "cd '$REPOSITORY' && git checkout '$VERSION' && git submodule update" "$UNIX_USER"
+fi
+
+# Create a log directoryfor Docker builds - this is normally done above.
+if [ $DOCKER = true ]; then
+    make_log_directory
+fi
 
 install_website_packages
 
-su -l -c "touch '$DIRECTORY/admin-htpasswd'" "$UNIX_USER"
+if [ $INSTALL_DB = true ]; then
+    add_postgresql_user
+fi
 
-add_website_to_nginx
+export DEVELOPMENT_INSTALL DOCKER INSTALL_DB
+su -c "$REPOSITORY/bin/install-as-user '$UNIX_USER' '$HOST' '$DIRECTORY'" "$UNIX_USER"
 
-add_postgresql_user
-
-su -l -c "$REPOSITORY/bin/install-as-user '$UNIX_USER' '$HOST' '$DIRECTORY'" "$UNIX_USER"
-
-install_sysvinit_script
+if [ ! "$DEVELOPMENT_INSTALL" = true ]; then
+    install_sysvinit_script
+fi
 
 if [ $DEFAULT_SERVER = true ] && [ x != x$EC2_HOSTNAME ]
 then
@@ -45,9 +73,11 @@ then
     overwrite_rc_local
 fi
 
-# Tell the user what to do next:
+if [ ! "$DEVELOPMENT_INSTALL" = true ] && [ ! "$DOCKER" = true ]; then
+    # Tell the user what to do next:
 
-echo Installation complete - you should now be able to view the site at:
-echo   http://$HOST/
-echo Or you can run the tests by switching to the "'$UNIX_USER'" user and
-echo running: $REPOSITORY/bin/cron-wrapper prove -r t
+    echo Installation complete - you should now be able to view the site at:
+    echo   http://$HOST/
+    echo Or you can run the tests by switching to the "'$UNIX_USER'" user and
+    echo running: $REPOSITORY/script/test
+fi

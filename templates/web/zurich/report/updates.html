@@ -1,15 +1,11 @@
-[% IF problem.state == 'fixed - council' OR problem.state == 'closed' %]
+[% IF c.cobrand.problem_has_public_response(problem) %]
     <h4 class="static-with-rule">[% loc('Updates') %]</h4>
-    <ul class="issue-list">
-        <li>
-            <div class="update-wrap">
-                <div class="update-text">
-                    <p class="meta-2">[% prettify_dt( problem.lastupdate_local, 'zurich' ) %]</p>
-                  [% IF problem.state == 'fixed - council' %]
-                    [% add_links( problem.extra.public_response ) | html_para %]
-                  [% ELSIF problem.state == 'closed' AND problem.external_body %]
-                    <p>[% tprintf( loc('Assigned to %s'), problem.body(c).name ) %]</p>
-                  [% END %]
+    <ul class="item-list item-list--updates">
+        <li class="item-list__item item-list__item--updates">
+            <div class="item-list__update-wrap">
+                <div class="item-list__update-text">
+                    <p class="meta-2">[% prettify_dt( problem.lastupdate, 'zurich' ) %]</p>
+                    [% problem.extra.public_response | add_links | html_para %]
                 </div>
             </div>
         </li>

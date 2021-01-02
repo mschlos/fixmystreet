@@ -10,12 +10,10 @@ NB: this is moderately specific to producing cobrands for UK councils
 1: copy an exiting perllib/FixMyStreet/Cobrand/ file to perllib/FixMyStreet/Cobrand/ExampleCom.pm
     * Change package name at top of file
     * Change following functions accordingly:
-        site_restriction
-        problems_clause
+        problems_restriction/updates_restriction
         enter_postcode_text
         area_check
         base_url
-        all_councils_report should return 0
         disambiguate_location - see below for details on this
 
 2: create a web/cobrands/examplecom folder and put custom css/images/js in here

@@ -4,10 +4,10 @@ use namespace::autoclean;
 
 BEGIN { extends 'Catalyst::Controller'; }
 
-use JSON;
+use JSON::MaybeXS;
 use DateTime;
 use DateTime::Format::ISO8601;
-use List::MoreUtils 'uniq';
+use FixMyStreet::DateRange;
 
 =head1 NAME
 
@@ -37,9 +37,9 @@ sub problems : Local {
       :                         '';
 
     # gather the parameters
-    my $start_date = $c->req->param('start_date') || '';
-    my $end_date   = $c->req->param('end_date')   || '';
-    my $category   = $c->req->param('category')   || '';
+    my $start_date = $c->get_param('start_date') || '';
+    my $end_date = $c->get_param('end_date') || '';
+    my $category = $c->get_param('category') || '';
 
     my $yyyy_mm_dd = qr{^\d{4}-\d\d-\d\d$};
     if (   $start_date !~ $yyyy_mm_dd
@@ -50,16 +50,19 @@ sub problems : Local {
     }
 
     # convert the dates to datetimes and trap errors
-    my $iso8601  = DateTime::Format::ISO8601->new;
-    my $start_dt = eval { $iso8601->parse_datetime($start_date); };
-    my $end_dt   = eval { $iso8601->parse_datetime($end_date); };
-    unless ( $start_dt && $end_dt ) {
+    my $range = FixMyStreet::DateRange->new(
+        start_date => $start_date,
+        end_date => $end_date,
+        parser => DateTime::Format::ISO8601->new,
+        formatter => $c->model('DB')->schema->storage->datetime_parser,
+    );
+    unless ($range->start && $range->end) {
         $c->stash->{error} = 'Invalid dates supplied';
         return;
     }
 
     # check that the dates are sane
-    if ( $start_dt > $end_dt ) {
+    if ($range->start >= $range->end) {
         $c->stash->{error} = 'Start date after end date';
         return;
     }
@@ -80,13 +83,10 @@ sub problems : Local {
         $date_col = 'lastupdate';
     }
 
-    my $one_day = DateTime::Duration->new( days => 1 );
     my $query = {
-        $date_col => {
-            '>=' => $start_dt,
-            '<=' => $end_dt + $one_day,
-        },
+        $date_col => $range->sql,
         state => [ @state ],
+        non_public => 0,
     };
     $query->{category} = $category if $category;
     my @problems = $c->cobrand->problems->search( $query, {
@@ -101,12 +101,12 @@ sub problems : Local {
     } );
 
     foreach my $problem (@problems) {
+        $c->cobrand->call_hook(munge_problem_list => $problem);
         $problem->name( '' ) if $problem->anonymous == 1;
         $problem->service( 'Web interface' ) if $problem->service eq '';
-        my $bodies = $problem->bodies;
-        if (keys %$bodies) {
-             my @body_names = map { $_->name } values %$bodies;
-             $problem->bodies_str( join(' and ', @body_names) );
+        my $body_names = $problem->body_names;
+        if (@$body_names) {
+             $problem->bodies_str( join(' and ', @$body_names) );
         }
     }
 

@@ -4,38 +4,41 @@ use base 'DBIx::Class::ResultSet';
 use strict;
 use warnings;
 
-sub timeline {
-    my ( $rs, $restriction ) = @_;
+use Moo;
+with 'FixMyStreet::Roles::FullTextSearch';
+__PACKAGE__->load_components('Helper::ResultSet::Me');
+sub text_search_columns { qw(id problem_id name text) }
+sub text_search_nulls { qw(name) }
+sub text_search_translate { '/.' }
 
-    my $prefetch = 
-        FixMyStreet::App->model('DB')->schema->storage->sql_maker->quote_char ?
-        [ qw/user/ ] :
-        [];
+sub to_body {
+    my ($rs, $bodies) = @_;
+    return FixMyStreet::DB::ResultSet::Problem::to_body($rs, $bodies, 1);
+}
+
+sub timeline {
+    my ( $rs ) = @_;
 
     return $rs->search(
         {
-            state => 'confirmed',
-            created => { '>=', \"ms_current_timestamp()-'7 days'::interval" },
-            %{ $restriction },
+            'me.state' => 'confirmed',
+            'me.created' => { '>=', \"current_timestamp-'7 days'::interval" },
         },
         {
-            prefetch => $prefetch,
+            prefetch => 'user',
         }
     );
 }
 
 sub summary_count {
-    my ( $rs, $restriction ) = @_;
+    my ( $rs ) = @_;
 
-    return $rs->search(
-            $restriction,
-        {
-            group_by => ['me.state'],
-            select   => [ 'me.state', { count => 'me.id' } ],
-            as       => [qw/state state_count/],
-            join     => 'problem'
-        }
-    );
+    my $params = {
+        group_by => ['me.state'],
+        select   => [ 'me.state', { count => 'me.id' } ],
+        as       => [qw/state state_count/],
+    };
+    return $rs->search(undef, $params);
 }
 
 1;

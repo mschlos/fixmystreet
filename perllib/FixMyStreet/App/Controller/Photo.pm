@@ -4,12 +4,10 @@ use namespace::autoclean;
 
 BEGIN {extends 'Catalyst::Controller'; }
 
-use DateTime::Format::HTTP;
-use Digest::SHA1 qw(sha1_hex);
-use File::Path;
-use File::Slurp;
-use Path::Class;
-use if !$ENV{TRAVIS}, 'Image::Magick';
+use JSON::MaybeXS;
+use Path::Tiny;
+use Try::Tiny;
+use FixMyStreet::App::Model::PhotoSet;
 
 =head1 NAME
 
@@ -30,67 +28,65 @@ Display a photo
 
 =cut
 
-sub during :LocalRegex('^([0-9a-f]{40})\.temp\.jpeg$') {
+sub during :LocalRegex('^(temp|fulltemp)\.([0-9a-f]{40}\.(?:jpeg|png|gif|tiff))$') {
     my ( $self, $c ) = @_;
-    my ( $hash ) = @{ $c->req->captures };
+    my ( $size, $filename ) = @{ $c->req->captures };
 
-    my $file = file( $c->config->{UPLOAD_DIR}, "$hash.jpeg" );
-    my $photo = $file->slurp;
+    my $photoset = FixMyStreet::App::Model::PhotoSet->new({
+        data_items => [ $filename ]
+    });
 
-    if ( $c->cobrand->default_photo_resize ) {
-        $photo = _shrink( $photo, $c->cobrand->default_photo_resize );
-    } else {
-        $photo = _shrink( $photo, '250x250' );
-    }
+    $size = $size eq 'temp' ? 'default' : 'full';
+    my $photo = $photoset->get_image_data(size => $size, default => $c->cobrand->default_photo_resize);
 
+    $c->stash->{non_public} = 0;
     $c->forward( 'output', [ $photo ] );
 }
 
-sub index :LocalRegex('^(c/)?(\d+)(?:\.(full|tn|fp))?\.jpeg$') {
+sub index :LocalRegex('^(c/)?([1-9]\d*)(?:\.(\d+))?(?:\.(full|tn|fp|og))?\.(?:jpeg|png|gif|tiff)$') {
     my ( $self, $c ) = @_;
-    my ( $is_update, $id, $size ) = @{ $c->req->captures };
+    my ( $is_update, $id, $photo_number, $size ) = @{ $c->req->captures };
 
-    my @photo;
+    $photo_number ||= 0;
+    $size ||= '';
+
+    my $item;
     if ( $is_update ) {
-        @photo = $c->model('DB::Comment')->search( {
-            id => $id,
-            state => 'confirmed',
-            photo => { '!=', undef },
-        } );
+        ($item) = $c->cobrand->updates->search( {
+            'me.id' => $id,
+            'me.state' => 'confirmed',
+            'problem.state' => [ FixMyStreet::DB::Result::Problem->visible_states() ],
+            'me.photo' => { '!=', undef },
+        }, { prefetch => 'problem' });
     } else {
-        # GoogleBot-Image is doing this for some reason?
-        if ( $id =~ m{ ^(\d+) \D .* $ }x ) {
-            return $c->res->redirect( $c->uri_with( { id => $1 } ), 301 );
-        }
-
-        $c->detach( 'no_photo' ) if $id =~ /\D/;
-        @photo = $c->cobrand->problems->search( {
+        ($item) = $c->cobrand->problems->search( {
             id => $id,
-            state => [ FixMyStreet::DB::Result::Problem->visible_states(), 'partial' ],
+            state => [ FixMyStreet::DB::Result::Problem->visible_states() ],
             photo => { '!=', undef },
         } );
     }
 
-    $c->detach( 'no_photo' ) unless @photo;
+    $c->detach( 'no_photo' ) unless $item;
 
-    my $photo = $photo[0]->photo;
+    $c->detach( 'no_photo' ) unless $c->cobrand->allow_photo_display($item, $photo_number); # Should only be for reports, not updates
 
-    # If photo field contains a hash
-    if (length($photo) == 40) {
-        my $file = file( $c->config->{UPLOAD_DIR}, "$photo.jpeg" );
-        $photo = $file->slurp;
+    my $problem = $is_update ? $item->problem : $item;
+    $c->stash->{non_public} = $problem->non_public;
+
+    if ($c->stash->{non_public}) {
+        my $body_ids = $problem->bodies_str_ids;
+        # Check permission
+        $c->detach('no_photo') unless $c->user_exists;
+        $c->detach('no_photo') unless $c->user->is_superuser
+            || $c->user->id == $problem->user->id
+            || $c->user->has_permission_to('report_inspect', $body_ids)
+            || $c->user->has_permission_to('report_mark_private', $body_ids);
     }
 
-    if ( $size eq 'tn' ) {
-        $photo = _shrink( $photo, 'x100' );
-    } elsif ( $size eq 'fp' ) {
-        $photo = _crop( $photo );
-    } elsif ( $size eq 'full' ) {
-    } elsif ( $c->cobrand->default_photo_resize ) {
-        $photo = _shrink( $photo, $c->cobrand->default_photo_resize );
-    } else {
-        $photo = _shrink( $photo, '250x250' );
-    }
+    my $photo;
+    $photo = $item->get_photoset
+        ->get_image_data( num => $photo_number, size => $size, default => $c->cobrand->default_photo_resize )
+        or $c->detach( 'no_photo' );
 
     $c->forward( 'output', [ $photo ] );
 }
@@ -99,11 +95,15 @@ sub output : Private {
     my ( $self, $c, $photo ) = @_;
 
     # Save to file
-    File::Path::make_path( FixMyStreet->path_to( 'web', 'photo', 'c' )->stringify );
-    File::Slurp::write_file( FixMyStreet->path_to( 'web', $c->req->path )->stringify, \$photo );
+    if (!FixMyStreet->config('LOGIN_REQUIRED') && !$c->stash->{non_public}) {
+        path(FixMyStreet->path_to('web', 'photo', 'c'))->mkpath;
+        my $out = FixMyStreet->path_to('web', $c->req->path);
+        my $symlink_exists = $photo->{symlink} ? symlink($photo->{symlink}, $out) : undef;
+        path($out)->spew_raw($photo->{data}) unless $symlink_exists;
+    }
 
-    $c->res->content_type( 'image/jpeg' );
-    $c->res->body( $photo );
+    $c->res->content_type( $photo->{content_type} );
+    $c->res->body( $photo->{data} );
 }
 
 sub no_photo : Private {
@@ -111,32 +111,35 @@ sub no_photo : Private {
     $c->detach( '/page_error_404_not_found', [ 'No photo' ] );
 }
 
-# Shrinks a picture to the specified size, but keeping in proportion.
-sub _shrink {
-    my ($photo, $size) = @_;
-    my $image = Image::Magick->new;
-    $image->BlobToImage($photo);
-    my $err = $image->Scale(geometry => "$size>");
-    throw Error::Simple("resize failed: $err") if "$err";
-    $image->Strip();
-    my @blobs = $image->ImageToBlob();
-    undef $image;
-    return $blobs[0];
-}
+sub upload : Local {
+    my ( $self, $c ) = @_;
+    my @items = (
+        ( map {
+            /^photo/ ? # photo, photo1, photo2 etc.
+                ($c->req->upload($_)) : ()
+        } sort $c->req->upload),
+    );
+    my $photoset = FixMyStreet::App::Model::PhotoSet->new({
+        c => $c,
+        data_items => \@items,
+    });
+    my $fileid = try {
+        $photoset->data;
+    } catch {
+        $c->log->debug("Photo upload failed.");
+        $c->stash->{photo_error} = _("Photo upload failed.");
+        return undef;
+    };
+    my $out;
+    if ($c->stash->{photo_error} || !$fileid) {
+        $c->res->status(500);
+        $out = { error => $c->stash->{photo_error} || _('Unknown error') };
+    } else {
+        $out = { id => $fileid };
+    }
 
-# Shrinks a picture to 90x60, cropping so that it is exactly that.
-sub _crop {
-    my ($photo) = @_;
-    my $image = Image::Magick->new;
-    $image->BlobToImage($photo);
-    my $err = $image->Resize( geometry => "90x60^" );
-    throw Error::Simple("resize failed: $err") if "$err";
-    $err = $image->Extent( geometry => '90x60', gravity => 'Center' );
-    throw Error::Simple("resize failed: $err") if "$err";
-    $image->Strip();
-    my @blobs = $image->ImageToBlob();
-    undef $image;
-    return $blobs[0];
+    $c->res->content_type('application/json; charset=utf-8');
+    $c->res->body(encode_json($out));
 }
 
 =head2 process_photo
@@ -151,80 +154,67 @@ sub process_photo : Private {
     my ( $self, $c ) = @_;
 
     return
-         $c->forward('process_photo_upload')
-      || $c->forward('process_photo_cache')
+         $c->forward('process_photo_upload_or_cache')
+      || $c->forward('process_photo_required')
       || 1;    # always return true
 }
 
-sub process_photo_upload : Private {
+sub process_photo_upload_or_cache : Private {
     my ( $self, $c ) = @_;
+    my @items = (
+        ( map {
+            /^photo/ ? # photo, photo1, photo2 etc.
+                ($c->req->upload($_)) : ()
+        } sort $c->req->upload),
+        grep { $_ } split /,/, ($c->get_param('upload_fileid') || '')
+    );
 
-    # check for upload or return
-    my $upload = $c->req->upload('photo')
-      || return;
+    my $photoset = FixMyStreet::App::Model::PhotoSet->new({
+        c => $c,
+        data_items => \@items,
+    });
 
-    # check that the photo is a jpeg
-    my $ct = $upload->type;
-    $ct =~ s/x-citrix-//; # Thanks, Citrix
-    # Had a report of a JPEG from an Android 2.1 coming through as a byte stream
-    unless ( $ct eq 'image/jpeg' || $ct eq 'image/pjpeg' || $ct eq 'application/octet-stream' ) {
-        $c->log->info('Bad photo tried to upload, type=' . $ct);
-        $c->stash->{photo_error} = _('Please upload a JPEG image only');
-        return;
-    }
+    my $fileid = $photoset->data;
 
-    # get the photo into a variable
-    my $photo_blob = eval {
-        my $filename = $upload->tempname;
-        my $out = `jhead -se -autorot $filename 2>&1`;
-        die _("Please upload a JPEG image only"."\n") if $out =~ /Not JPEG:/;
-        my $photo = $upload->slurp;
-        return $photo;
-    };
-    if ( my $error = $@ ) {
-        my $format = _(
-"That image doesn't appear to have uploaded correctly (%s), please try again."
-        );
-        $c->stash->{photo_error} = sprintf( $format, $error );
-        return;
-    }
-
-    # we have an image we can use - save it to the upload dir for storage
-    my $cache_dir = dir( $c->config->{UPLOAD_DIR} );
-    $cache_dir->mkpath;
-    unless ( -d $cache_dir && -w $cache_dir ) {
-        warn "Can't find/write to photo cache directory '$cache_dir'";
-        return;
-    }
-
-    my $fileid = sha1_hex($photo_blob);
-    $upload->copy_to( file($cache_dir, $fileid . '.jpeg') );
-
-    # stick the hash on the stash, so don't have to reupload in case of error
-    $c->stash->{upload_fileid} = $fileid;
-
+    $c->stash->{upload_fileid} = $fileid or return;
     return 1;
 }
 
-=head2 process_photo_cache
+=head2 process_photo_required
 
-Look for the upload_fileid parameter and check it matches a file on disk. If it
-does return true and put fileid on stash, otherwise false.
+Checks that a report has a photo attached if any of its Contacts
+require it (by setting extra->photo_required == 1). Puts an error in
+photo_error on the stash if it's required and missing, otherwise returns
+true.
+
+(Note that as we have reached this action, we *know* that the photo
+is missing, otherwise it would have already been handled.)
 
 =cut
 
-sub process_photo_cache : Private {
+sub process_photo_required : Private {
     my ( $self, $c ) = @_;
 
-    # get the fileid and make sure it is just a hex number
-    my $fileid = $c->req->param('upload_fileid') || '';
-    $fileid =~ s{[^0-9a-f]}{}gi;
-    return unless $fileid;
+    # load the report
+    my $report = $c->stash->{report} or return 1; # don't check photo for updates
+    my $bodies = $c->stash->{bodies};
 
-    my $file = file( $c->config->{UPLOAD_DIR}, "$fileid.jpeg" );
-    return unless -e $file;
+    my @contacts = $c->       #
+      model('DB::Contact')    #
+      ->not_deleted           #
+      ->search(
+        {
+            body_id => [ keys %$bodies ],
+            category => $report->category
+        }
+      )->all;
+      foreach my $contact ( @contacts ) {
+          if ( $contact->get_extra_metadata('photo_required') ) {
+              $c->stash->{photo_error} = _("Photo is required.");
+              return;
+          }
+      }
 
-    $c->stash->{upload_fileid} = $fileid;
     return 1;
 }
 

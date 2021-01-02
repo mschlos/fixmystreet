@@ -1,5 +1,3 @@
-#!/usr/bin/perl
-#
 # FixMyStreet:Map::OSM::StreetView
 # OSM StreetView maps on FixMyStreet.
 #
@@ -11,19 +9,22 @@ use base 'FixMyStreet::Map::OSM';
 
 use strict;
 
-sub map_type {
-    return '""';
-}
+use constant ZOOM_LEVELS => 6;
 
-sub map_template {
-    return 'osm-streetview';
-}
+sub map_type { '' }
+
+sub map_javascript { [
+    '/vendor/OpenLayers/OpenLayers.fixmystreet.js',
+    '/js/map-OpenLayers.js',
+    '/js/map-streetview.js',
+] }
 
 sub base_tile_url {
     return 'os.openstreetmap.org/sv';
 }
 
 sub copyright {
+    'Contains OS data &copy; Crown copyright and database right 2016';
 }
 
 1;

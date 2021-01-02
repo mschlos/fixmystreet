@@ -1,64 +1,55 @@
 package FixMyStreet::SendReport::Email;
 
-use Moose;
+use Moo;
+use MooX::Types::MooseLike::Base qw(:all);
+use FixMyStreet::Email;
+use Utils::Email;
 
 BEGIN { extends 'FixMyStreet::SendReport'; }
 
-use mySociety::EmailUtil;
+has to => ( is => 'ro', isa => ArrayRef, default => sub { [] } );
+has bcc => ( is => 'ro', isa => ArrayRef, default => sub { [] } );
+
+has use_verp => ( is => 'ro', isa => Int, default => 1 );
+has use_replyto => ( is => 'ro', isa => Int, default => 0 );
 
 sub build_recipient_list {
     my ( $self, $row, $h ) = @_;
-    my %recips;
 
     my $all_confirmed = 1;
     foreach my $body ( @{ $self->bodies } ) {
 
-        my $contact = FixMyStreet::App->model("DB::Contact")->find( {
-            deleted => 0,
-            body_id => $body->id,
-            category => $row->category
-        } );
+        my $contact = $self->fetch_category($body, $row) or next;
 
-        my ($body_email, $confirmed, $note) = ( $contact->email, $contact->confirmed, $contact->note );
+        my ($body_email, $state, $note) = ( $contact->email, $contact->state, $contact->note );
 
-        $body_email = essex_contact($row->latitude, $row->longitude) if $body->areas->{2225};
-        $body_email = oxfordshire_contact($row->latitude, $row->longitude) if $body->areas->{2237} && $body_email eq 'SPECIAL';
-
-        unless ($confirmed) {
+        unless ($state eq 'confirmed') {
             $all_confirmed = 0;
             $note = 'Body ' . $row->bodies_str . ' deleted'
                 unless $note;
             $body_email = 'N/A' unless $body_email;
-            $self->unconfirmed_counts->{$body_email}{$row->category}++;
-            $self->unconfirmed_notes->{$body_email}{$row->category} = $note;
+            $self->unconfirmed_data->{$body_email}{$row->category}{count}++;
+            $self->unconfirmed_data->{$body_email}{$row->category}{note} = $note;
         }
 
-        # see something uses council areas but doesn't send to councils so just use a
-        # generic name here to minimise confusion
-        if ( $row->cobrand eq 'seesomething' ) {
-            push @{ $self->to }, [ $body_email, 'See Something, Say Something' ];
+        my @emails;
+        # allow multiple emails per contact
+        if ( $body_email =~ /,/ ) {
+            @emails = split(/,/, $body_email);
         } else {
-            push @{ $self->to }, [ $body_email, $body->name ];
+            @emails = ( $body_email );
         }
-        $recips{$body_email} = 1;
+        for my $email ( @emails ) {
+            push @{ $self->to }, [ $email, $body->name ];
+        }
     }
 
-    return () unless $all_confirmed;
-    return keys %recips;
+    return $all_confirmed && @{$self->to};
 }
 
 sub get_template {
     my ( $self, $row ) = @_;
-
-    my $template = 'submit.txt';
-    $template = 'submit-brent.txt' if $row->bodies_str eq 2488 || $row->bodies_str eq 2237;
-    my $template_path = FixMyStreet->path_to( "templates", "email", $row->cobrand, $row->lang, $template )->stringify;
-    $template_path = FixMyStreet->path_to( "templates", "email", $row->cobrand, $template )->stringify
-        unless -e $template_path;
-    $template_path = FixMyStreet->path_to( "templates", "email", "default", $template )->stringify
-        unless -e $template_path;
-    $template = Utils::read_file( $template_path );
-    return $template;
+    return 'submit.txt';
 }
 
 sub send_from {
@@ -66,36 +57,69 @@ sub send_from {
     return [ $row->user->email, $row->name ];
 }
 
+sub envelope_sender {
+    my ($self, $row) = @_;
+
+    my $cobrand = $row->get_cobrand_logged;
+    if ($self->use_verp && $row->user->email && $row->user->email_verified) {
+        return FixMyStreet::Email::unique_verp_id([ 'report', $row->id ], $cobrand->call_hook('verp_email_domain'));
+    }
+    return $cobrand->do_not_reply_email;
+}
+
 sub send {
     my $self = shift;
     my ( $row, $h ) = @_;
 
-    my @recips = $self->build_recipient_list( $row, $h );
+    my $recips = @{$self->to} ? 1 : $self->build_recipient_list( $row, $h );
 
     # on a staging server send emails to ourselves rather than the bodies
-    if (mySociety::Config::get('STAGING_SITE') && !mySociety::Config::get('SEND_REPORTS_ON_STAGING') && !FixMyStreet->test_mode) {
-        @recips = ( mySociety::Config::get('CONTACT_EMAIL') );
+    if (FixMyStreet->staging_flag('send_reports', 0) && !FixMyStreet->test_mode) {
+        $recips = 1;
+        @{$self->to} = [ $row->user->email, $self->to->[0][1] || $row->name ];
     }
 
-    unless ( @recips ) {
+    unless ($recips) {
         $self->error( 'No recipients' );
         return 1;
     }
 
     my ($verbose, $nomail) = CronFns::options();
-    my $result = FixMyStreet::App->send_email_cron(
-        {
-            _template_ => $self->get_template( $row ),
-            _parameters_ => $h,
-            To => $self->to,
-            From => $self->send_from( $row ),
-        },
-        mySociety::Config::get('CONTACT_EMAIL'),
-        \@recips,
-        $nomail
-    );
+    my $cobrand = $row->get_cobrand_logged;
+    $cobrand = $cobrand->call_hook(get_body_handler_for_problem => $row) || $cobrand;
 
-    if ( $result == mySociety::EmailUtil::EMAIL_SUCCESS ) {
+    my $params = {
+        To => $self->to,
+    };
+
+    $cobrand->call_hook(munge_sendreport_params => $row, $h, $params);
+
+    $params->{Bcc} = $self->bcc if @{$self->bcc};
+
+    my $sender = $self->envelope_sender($row);
+    if ($row->user->email && $row->user->email_verified) {
+        $params->{From} = $self->send_from( $row );
+    } else {
+        my $name = sprintf(_("On behalf of %s"), @{ $self->send_from($row) }[1]);
+        $params->{From} = [ $sender, $name ];
+    }
+
+    if (FixMyStreet::Email::test_dmarc($params->{From}[0])
+      || $self->use_replyto
+      || Utils::Email::same_domain($params->{From}, $params->{To})) {
+        $params->{'Reply-To'} = [ $params->{From} ];
+        $params->{From} = [ $sender, $params->{From}[1] ];
+    }
+
+    my $result = FixMyStreet::Email::send_cron($row->result_source->schema,
+        $self->get_template($row), {
+            %$h,
+            cobrand => $cobrand, # For correct logo that uses cobrand object
+        },
+        $params, $sender, $nomail, $cobrand, $row->lang);
+
+    unless ($result) {
+        $row->set_extra_metadata('sent_to' => email_list($params->{To}));
         $self->success(1);
     } else {
         $self->error( 'Failed to send email' );
@@ -104,35 +128,10 @@ sub send {
     return $result;
 }
 
-# Essex has different contact addresses depending upon the district
-# Might be easier if we start storing in the db all areas covered by a point
-# Will do for now :)
-sub essex_contact {
-    my $district = _get_district_for_contact(@_);
-    my $email;
-    $email = 'eastarea' if $district == 2315 || $district == 2312;
-    $email = 'midarea' if $district == 2317 || $district == 2314 || $district == 2316;
-    $email = 'southarea' if $district == 2319 || $district == 2320 || $district == 2310;
-    $email = 'westarea' if $district == 2309 || $district == 2311 || $district == 2318 || $district == 2313;
-    die "Returned district $district which is not in Essex!" unless $email;
-    return "highways.$email\@essexcc.gov.uk";
+sub email_list {
+    my $list = shift;
+    my @list = map { ref $_ ? $_->[0] : $_ } @$list;
+    return \@list;
 }
 
-# Oxfordshire has different contact addresses depending upon the district
-sub oxfordshire_contact {
-    my $district = _get_district_for_contact(@_);
-    my $email;
-    $email = 'northernarea' if $district == 2419 || $district == 2420 || $district == 2421;
-    $email = 'southernarea' if $district == 2417 || $district == 2418;
-    die "Returned district $district which is not in Oxfordshire!" unless $email;
-    return "$email\@oxfordshire.gov.uk";
-}
-
-sub _get_district_for_contact {
-    my ( $lat, $lon ) = @_;
-    my $district =
-      mySociety::MaPit::call( 'point', "4326/$lon,$lat", type => 'DIS' );
-    ($district) = keys %$district;
-    return $district;
-}
 1;

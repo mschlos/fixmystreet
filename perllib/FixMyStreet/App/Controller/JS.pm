@@ -20,11 +20,11 @@ of translation strings.
 sub translation_strings : LocalRegex('^translation_strings\.(.*?)\.js$') : Args(0) {
     my ( $self, $c ) = @_;
     my $lang = $c->req->captures->[0];
-    $c->cobrand->set_lang_and_domain( $lang, 1 );
+    $c->cobrand->set_lang_and_domain( $lang, 1,
+        FixMyStreet->path_to('locale')->stringify
+    );
     $c->res->content_type( 'application/javascript' );
 }
-
-sub validation_rules : Path('validation_rules.js') : Args(0) { }
 
 __PACKAGE__->meta->make_immutable;
 

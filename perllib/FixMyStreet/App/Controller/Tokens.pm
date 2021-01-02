@@ -33,79 +33,19 @@ sub confirm_problem : Path('/P') {
 
     # Load the problem
     my $data = $auth_token->data;
-    my $problem_id = ref $data ? $data->{id} : $data;
+    $data = { id => $data } unless ref $data;
+    $c->stash->{token_data} = $data;
+
     # Look at all problems, not just cobrand, in case am approving something we don't actually show
-    my $problem = $c->model('DB::Problem')->find( { id => $problem_id } )
+    my $problem = $c->model('DB::Problem')->find( { id => $data->{id} } )
       || $c->detach('token_error');
-    $c->stash->{problem} = $problem;
+    $c->stash->{report} = $problem;
 
-    if ( $problem->state eq 'unconfirmed' && $auth_token->created < DateTime->now->subtract( months => 1 ) ) {
-        $c->stash->{template} = 'errors/generic.html';
-        $c->stash->{message} = _("I'm afraid we couldn't validate that token, as the report was made too long ago.");
-        return;
-    }
+    $c->detach('token_too_old')
+        if $problem->state eq 'unconfirmed'
+        && $auth_token->created < DateTime->now->subtract( months => 1 );
 
-    # check that this email or domain are not the cause of abuse. If so hide it.
-    if ( $problem->is_from_abuser ) {
-        $problem->update(
-            { state => 'hidden', lastupdate => \'ms_current_timestamp()' } );
-        $c->stash->{template} = 'tokens/abuse.html';
-        return;
-    }
-
-    # For Zurich, email confirmation simply sets a flag, it does not change the
-    # problem state, log in, or anything else
-    if ($c->cobrand->moniker eq 'zurich') {
-        my $extra = { %{ $problem->extra || {} } };
-        $extra->{email_confirmed} = 1;
-        $problem->update( {
-            extra => $extra,
-            confirmed => \'ms_current_timestamp()',
-        } );
-
-        $c->stash->{report} = $c->stash->{problem};
-        $c->forward( '/report/new/create_reporter_alert' );
-
-        if ( ref($data) && ( $data->{name} || $data->{password} ) ) {
-            $problem->user->name( $data->{name} ) if $data->{name};
-            $problem->user->phone( $data->{phone} ) if $data->{phone};
-            $problem->user->update;
-        }
-
-        return 1;
-    }
-
-    # We have a problem - confirm it if needed!
-    my $old_state = $problem->state;
-    $problem->update(
-        {
-            state      => 'confirmed',
-            confirmed  => \'ms_current_timestamp()',
-            lastupdate => \'ms_current_timestamp()',
-        }
-    ) if $problem->state eq 'unconfirmed';
-
-    # Subscribe problem reporter to email updates
-    $c->stash->{report} = $c->stash->{problem};
-    $c->forward( '/report/new/create_reporter_alert' );
-
-    # log the problem creation user in to the site
-    if ( ref($data) && ( $data->{name} || $data->{password} ) ) {
-        $problem->user->name( $data->{name} ) if $data->{name};
-        $problem->user->phone( $data->{phone} ) if $data->{phone};
-        $problem->user->password( $data->{password}, 1 ) if $data->{password};
-        $problem->user->title( $data->{title} ) if $data->{title};
-        $problem->user->update;
-    }
-    $c->authenticate( { email => $problem->user->email }, 'no_password' );
-    $c->set_session_cookie_expire(0);
-
-    if ( FixMyStreet::DB::Result::Problem->visible_states()->{$old_state} ) {
-        my $report_uri = $c->cobrand->base_url_for_report( $problem ) . $problem->url;
-        $c->res->redirect($report_uri);
-    }
-
-    return 1;
+    $c->forward('/report/new/process_confirmation');
 }
 
 =head2 redirect_to_partial_problem
@@ -139,12 +79,16 @@ sub confirm_alert : Path('/A') {
 
     my $auth_token = $c->forward( 'load_auth_token', [ $token_code, 'alert' ] );
 
-    # Load the problem
+    # Load the alert
     my $alert_id = $auth_token->data->{id};
     $c->stash->{confirm_type} = $auth_token->data->{type};
     my $alert = $c->model('DB::Alert')->find( { id => $alert_id } )
       || $c->detach('token_error');
     $c->stash->{alert} = $alert;
+
+    $c->detach('token_too_old')
+        if $c->stash->{confirm_type} ne 'unsubscribe'
+        && $auth_token->created < DateTime->now->subtract( months => 1 );
 
     # check that this email or domain are not the cause of abuse. If so hide it.
     if ( $alert->is_from_abuser ) {
@@ -152,8 +96,10 @@ sub confirm_alert : Path('/A') {
         return;
     }
 
-    $c->authenticate( { email => $alert->user->email }, 'no_password' );
-    $c->set_session_cookie_expire(0);
+    if (!$alert->confirmed && $c->stash->{confirm_type} ne 'unsubscribe') {
+        $c->authenticate( { email => $alert->user->email, email_verified => 1 }, 'no_password' );
+        $c->set_session_cookie_expire(0);
+    }
 
     $c->forward('/alert/confirm');
 
@@ -175,32 +121,18 @@ sub confirm_update : Path('/C') {
     my $auth_token =
       $c->forward( 'load_auth_token', [ $token_code, 'comment' ] );
 
-    # Load the problem
-    my $data = $auth_token->data;
-    my $comment_id = $data->{id};
-    $c->stash->{add_alert} = $data->{add_alert};
+    # Load the update
+    my $data = $c->stash->{token_data} = $auth_token->data;
 
-    my $comment = $c->model('DB::Comment')->find( { id => $comment_id } )
+    my $comment = $c->model('DB::Comment')->find( { id => $data->{id} } )
       || $c->detach('token_error');
     $c->stash->{update} = $comment;
 
-    # check that this email or domain are not the cause of abuse. If so hide it.
-    if ( $comment->is_from_abuser ) {
-        $c->stash->{template} = 'tokens/abuse.html';
-        return;
-    }
+    $c->detach('token_too_old')
+        if $comment->state ne 'confirmed'
+        && $auth_token->created < DateTime->now->subtract( months => 1 );
 
-    if ( $data->{name} || $data->{password} ) {
-        $comment->user->name( $data->{name} ) if $data->{name};
-        $comment->user->password( $data->{password}, 1 ) if $data->{password};
-        $comment->user->update;
-    }
-    $c->authenticate( { email => $comment->user->email }, 'no_password' );
-    $c->set_session_cookie_expire(0);
-
-    $c->forward('/report/update/confirm');
-
-    return 1;
+    $c->forward('/report/update/process_confirmation');
 }
 
 sub load_questionnaire : Private {
@@ -209,6 +141,7 @@ sub load_questionnaire : Private {
     my $auth_token = $c->forward( 'load_auth_token', [ $token_code, 'questionnaire' ] );
     $c->stash->{id} = $auth_token->data;
     $c->stash->{token} = $token_code;
+    $c->stash->{token_obj} = $auth_token;
 
     my $questionnaire = $c->model('DB::Questionnaire')->find(
         { id => $c->stash->{id} },
@@ -222,9 +155,39 @@ sub questionnaire : Path('/Q') : Args(1) {
     my ( $self, $c, $token_code ) = @_;
     $c->forward( 'load_questionnaire', [ $token_code ] );
 
-    $c->authenticate( { email => $c->stash->{questionnaire}->problem->user->email }, 'no_password' );
-    $c->set_session_cookie_expire(0);
+    $c->detach('token_too_old') if $c->stash->{token_obj}->created < DateTime->now->subtract( months => 1 );
+
+    my $questionnaire = $c->stash->{questionnaire};
+    if (!$questionnaire->whenanswered) {
+        $c->authenticate( { email => $questionnaire->problem->user->email, email_verified => 1 }, 'no_password' );
+        $c->set_session_cookie_expire(0);
+    }
     $c->forward( '/questionnaire/show' );
+}
+
+=head2 alert_to_reporter
+
+    /R/([0-9A-Za-z]{16,18}).*$
+
+A link in an update alert to a problem reporter - show the "reopen report"
+tickbox but don't log the person in.
+
+=cut
+
+sub alert_to_reporter : Path('/R') {
+    my ( $self, $c, $token_code ) = @_;
+
+    my $auth_token =
+      $c->forward( 'load_auth_token', [ $token_code, 'alert_to_reporter' ] );
+    my $data = $auth_token->data;
+
+    my $problem_id = $data->{id};
+    my $problem = $c->model('DB::Problem')->find( { id => $problem_id } )
+      || $c->detach('token_error');
+
+    $c->flash->{alert_to_reporter} = $problem->id;
+    my $report_uri = $c->cobrand->base_url_for_report( $problem ) . $problem->url;
+    $c->res->redirect($report_uri);
 }
 
 =head2 load_auth_token
@@ -253,11 +216,7 @@ sub load_auth_token : Private {
         }
     );
 
-    unless ( $token ) {
-        $c->stash->{template} = 'errors/generic.html';
-        $c->stash->{message} = _("I'm afraid we couldn't validate that token. If you've copied the URL from an email, please check that you copied it exactly.\n");
-        $c->detach;
-    }
+    $c->detach('token_too_old') unless $token;
 
     return $token;
 }
@@ -271,6 +230,13 @@ Display an error page saying that there is something wrong with the token (our e
 sub token_error : Private {
     my ( $self, $c ) = @_;
     $c->stash->{template} = 'tokens/error.html';
+}
+
+sub token_too_old : Private {
+    my ( $self, $c ) = @_;
+    $c->stash->{token_not_found} = 1;
+    $c->stash->{template} = 'auth/token.html';
+    $c->response->status(400);
 }
 
 __PACKAGE__->meta->make_immutable;

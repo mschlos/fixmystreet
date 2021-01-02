@@ -1,30 +1,36 @@
 <!doctype html>
-<!--[if lt IE 7]><html class="ie6 oldie" lang="[% lang_code %]"><![endif]-->
-<!--[if IE 7]>   <html class="ie7 oldie" lang="[% lang_code %]"><![endif]-->
-<!--[if IE 8]>   <html class="ie8 oldie" lang="[% lang_code %]"><![endif]-->
-<!--[if gt IE 8]><!--><html lang="[% lang_code %]"><!--<![endif]-->
+<!--[if IE 8]>   <html class="no-js ie8" lang="[% lang_code %]"><![endif]-->
+<!--[if IE 9]>   <html class="no-js ie9" lang="[% lang_code %]"><![endif]-->
+<!--[if gt IE 9]><!--><html class="no-js" lang="[% lang_code %]"><!--<![endif]-->
     <head>
+        <meta name="viewport" content="initial-scale=1.0">
 
-        <link rel="stylesheet" type="text/css" href="[% version('/css/core.css') %]">
-        <link rel="stylesheet" type="text/css" href="[% version('/cobrands/fiksgatami/css.css') %]">
+        <meta http-equiv="X-UA-Compatible" content="IE=Edge,chrome=1">
+        <meta name="HandHeldFriendly" content="true">
+        <meta name="mobileoptimized" content="0">
 
-    [% INCLUDE 'common_header_tags.html', site_title = 'FiksGataMi' %]
+        [% INCLUDE 'header_opengraph.html' %]
+        [% INCLUDE 'header/css.html' %]
+        [% INCLUDE 'common_header_tags.html' %]
+
+        [% TRY %][% PROCESS 'header_extra.html' %][% CATCH file %][% END %]
+
     </head>
-    <body>
-
-        [% IF NOT title AND NOT c.req.path %]<h1 id="header">[% ELSE %]<div id="header"><a href="/">[% END %]
-            [%- loc('Fix<span id="my">My</span>Street') %]
-        [%- IF NOT title AND NOT c.req.path %]</h1>[% ELSE %]</a></div>[% END %]
-
-        <ul id="meta">
-            [% IF c.user_exists %]
-                <li>[% tprintf(loc('Signed in as %s'), c.user.name || c.user.email) %]
-                <li><a href="/auth/sign_out">[% loc('Sign out') %]</a></li>
-            [% ELSE %]
-                <li>&nbsp;</li>
-            [% END %]
-        </ul>
-
-        <div id="wrapper"><div id="mysociety">
+    [% TRY %][% PROCESS 'set_body_class.html' %][% CATCH file %][% END %]
+    <body class="[% bodyclass | html IF bodyclass %]">
 
     [% INCLUDE 'debug_header.html' %]
+
+    <div class="wrapper">
+        <div class="table-cell">
+            <header id="site-header" role="banner">
+                <div class="container">
+                    [% INCLUDE 'header_logo.html' %]
+                    <a href="#main-nav" id="nav-link">Main Navigation</a>
+                </div>
+            </header>
+
+            [% pre_container_extra | safe %]
+
+            <div class="container">
+                <div class="content[% " $mainclass" | html IF mainclass %]" role="main">

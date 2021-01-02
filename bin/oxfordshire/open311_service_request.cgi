@@ -4,7 +4,7 @@
 # passing them into Bentley EXOR backend via create_enquiry stored
 # procedure.
 #
-# mySociety: http://code.fixmystreet.com/
+# mySociety: http://fixmystreet.org/
 #-----------------------------------------------------------------
 
 require 'open311_services.pm';
@@ -114,7 +114,7 @@ XML
 # returns true if this looks like a long/lat value
 #------------------------------------------------------------------
 sub is_longlat {
-    return $_[0] =~ /^-?\d+\.\d+$/o? 1 : 0;
+    return $_[0] =~ /^-?\d+(\.\d+)?$/o ? 1 : 0;
 }
 
 #------------------------------------------------------------------
@@ -206,11 +206,11 @@ sub insert_into_pem {
     # incoming data
     $bindings{":ce_x"}             = $$h{$F{EASTING}};
     $bindings{":ce_y"}             = $$h{$F{NORTHING}};
-    $bindings{":ce_forename"}      = strip($$h{$F{FIRST_NAME}}, 30);     # 'CLIFF'
-    $bindings{":ce_surname"}       = strip($$h{$F{LAST_NAME}}, 30);      # 'STEWART'
-    $bindings{":ce_work_phone"}    = strip($$h{$F{PHONE}}, 25);          # '0117 600 4200'
-    $bindings{":ce_email"}         = strip($$h{$F{EMAIL}}, 50);          # 'info@exor.co.uk'
-    $bindings{":ce_description"}   = strip($description, 2000, $F{DESCRIPTION});          # 'Large Pothole'
+    $bindings{":ce_forename"}      = uc strip($$h{$F{FIRST_NAME}}, 30);     # 'CLIFF'
+    $bindings{":ce_surname"}       = uc strip($$h{$F{LAST_NAME}}, 30);      # 'STEWART'
+    $bindings{":ce_work_phone"}    = strip($$h{$F{PHONE}}, 25);             # '0117 600 4200'
+    $bindings{":ce_email"}         = uc strip($$h{$F{EMAIL}}, 50);          # 'info@exor.co.uk'
+    $bindings{":ce_description"}   = strip($description, 1970, $F{DESCRIPTION});          # 'Large Pothole'
 
     # nearest address guesstimate
     $bindings{":ce_location"}      = strip($location, 254);
@@ -313,7 +313,7 @@ sub strip {
         }
     }
     from_to($s, 'utf8', 'Windows-1252') if $ENCODE_TO_WIN1252;
-    return $max_len? substr($s, 0, 2000) : $s;
+    return $max_len? substr($s, 0, $max_len) : $s;
 }
 
 #------------------------------------------------------------------

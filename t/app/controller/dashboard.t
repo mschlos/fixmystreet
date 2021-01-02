@@ -1,677 +1,324 @@
+use Test::MockTime ':all';
+
+package FixMyStreet::Cobrand::No2FA;
+use parent 'FixMyStreet::Cobrand::FixMyStreet';
+sub must_have_2fa { 0 }
+
+package FixMyStreet::Cobrand::Tester;
+use parent 'FixMyStreet::Cobrand::Default';
+# Allow access if CSV export for a body, otherwise deny
+sub dashboard_permission {
+    my $self = shift;
+    my $c = $self->{c};
+    return 0 unless $c->get_param('export');
+    return $c->get_param('body') || 0;
+}
+
+package main;
+
 use strict;
 use warnings;
-use Test::More;
-
-# XXX
-plan skip_all => 'Disabling failing dashboard tests until they can be looked at';
-exit;
 
 use FixMyStreet::TestMech;
+use File::Temp 'tempdir';
+use Path::Tiny;
 use Web::Scraper;
+
+set_absolute_time('2014-02-01T12:00:00');
 
 my $mech = FixMyStreet::TestMech->new;
 
-my $test_user = 'council_user@example.com';
-my $test_pass = 'password';
-my $test_council = 2651;
-my $test_ward = 20723;
-
-$mech->create_body_ok($test_council, 'City of Edinburgh Council');
-
-$mech->delete_user( $test_user );
-my $user = FixMyStreet::App->model('DB::User')->create( {
-    email => $test_user,
-    password => $test_pass,
-} );
-
-my $p_user = FixMyStreet::App->model('DB::User')->find_or_create( {
-    email => 'p_user@example.com'
-} );
-
-$mech->not_logged_in_ok;
-$mech->get_ok('/dashboard');
-
-$mech->content_contains( 'sign in' );
-
-$mech->submit_form(
-    with_fields => { email => $test_user, password_sign_in => $test_pass }
-);
-
-is $mech->status, '404', 'If not council user get 404';
-
-$user->from_body( $test_council );
-$user->update;
-
-$mech->log_out_ok;
-$mech->get_ok('/dashboard');
-$mech->submit_form_ok( {
-    with_fields => { email => $test_user, password_sign_in => $test_pass }
-} );
-
-$mech->content_contains( 'City of Edinburgh' );
-
-FixMyStreet::App->model('DB::Contact')->search( { body_id => $test_council } )
-  ->delete;
-
-delete_problems();
-
-my @cats = qw( Grafitti Litter Potholes Other );
+my $other_body = $mech->create_body_ok(1234, 'Some Other Council');
+my $body = $mech->create_body_ok(2651, 'City of Edinburgh Council');
+my @cats = ('Litter', 'Other', 'Potholes', 'Traffic lights');
 for my $contact ( @cats ) {
-    FixMyStreet::App->model('DB::Contact')->create(
-        {
-            body_id    => $test_council,
-            category   => $contact,
-            email      => "$contact\@example.org",
-            confirmed  => 1,
-            whenedited => DateTime->now,
-            deleted    => 0,
-            editor     => 'test',
-            note       => 'test',
-        }
-    );
+    my $c = $mech->create_contact_ok(body_id => $body->id, category => $contact, email => "$contact\@example.org");
+    if ($contact eq 'Potholes') {
+        $c->set_extra_metadata(group => ['Road']);
+        $c->update;
+    }
 }
 
-$mech->get_ok('/dashboard');
+my $superuser = $mech->create_user_ok('superuser@example.com', name => 'Super User', is_superuser => 1);
+my $counciluser = $mech->create_user_ok('counciluser@example.com', name => 'Council User', from_body => $body);
+my $normaluser = $mech->create_user_ok('normaluser@example.com', name => 'Normal User');
+
+my $body_id = $body->id;
+my $area_id = '60705';
+my $alt_area_id = '62883';
+
+my $last_month = DateTime->now->subtract(months => 2);
+$mech->create_problems_for_body(2, $body->id, 'Title', { areas => ",$area_id,2651,", category => 'Potholes', cobrand => 'no2fat' });
+$mech->create_problems_for_body(3, $body->id, 'Title', { areas => ",$area_id,2651,", category => 'Traffic lights', cobrand => 'no2fa', dt => $last_month });
+$mech->create_problems_for_body(1, $body->id, 'Title', { areas => ",$alt_area_id,2651,", category => 'Litter', cobrand => 'no2fa' });
+
+my @scheduled_problems = $mech->create_problems_for_body(7, $body->id, 'Title', { areas => ",$area_id,2651,", category => 'Traffic lights', cobrand => 'no2fa' });
+my @fixed_problems = $mech->create_problems_for_body(4, $body->id, 'Title', { areas => ",$area_id,2651,", category => 'Potholes', cobrand => 'no2fa' });
+my @closed_problems = $mech->create_problems_for_body(3, $body->id, 'Title', { areas => ",$area_id,2651,", category => 'Traffic lights', cobrand => 'no2fa' });
+
+my $first_problem_id;
+my $first_update_id;
+foreach my $problem (@scheduled_problems) {
+    $problem->update({ state => 'action scheduled' });
+    my ($update) = $mech->create_comment_for_problem($problem, $counciluser, 'Title', 'text', 0, 'confirmed', 'action scheduled');
+    $first_problem_id = $problem->id unless $first_problem_id;
+    $first_update_id = $update->id unless $first_update_id;
+}
+
+foreach my $problem (@fixed_problems) {
+    $problem->update({ state => 'fixed - council' });
+    $mech->create_comment_for_problem($problem, $counciluser, 'Title', 'text', 0, 'confirmed', 'fixed');
+}
+
+foreach my $problem (@closed_problems) {
+    $problem->update({ state => 'closed' });
+    $mech->create_comment_for_problem($problem, $counciluser, 'Name', 'in progress text', 0, 'confirmed', 'in progress');
+    $mech->create_comment_for_problem($problem, $counciluser, 'Title', 'text', 0, 'confirmed', 'closed');
+}
 
 my $categories = scraper {
-    process "select[name=category] > option", 'cats[]' => 'TEXT',
-    process "select[name=ward] > option", 'wards[]' => 'TEXT',
+    process "select[name=category] option", 'cats[]' => 'TEXT',
     process "table[id=overview] > tr", 'rows[]' => scraper {
         process 'td', 'cols[]' => 'TEXT'
     },
-    process "tr[id=total] > td", 'totals[]' => 'TEXT',
-    process "tr[id=fixed_council] > td", 'council[]' => 'TEXT',
-    process "tr[id=fixed_user] > td", 'user[]' => 'TEXT',
-    process "tr[id=total_fixed] > td", 'total_fixed[]' => 'TEXT',
-    process "tr[id=in_progress] > td", 'in_progress[]' => 'TEXT',
-    process "tr[id=action_scheduled] > td", 'action_scheduled[]' => 'TEXT',
-    process "tr[id=investigating] > td", 'investigating[]' => 'TEXT',
-    process "tr[id=marked] > td", 'marked[]' => 'TEXT',
-    process "tr[id=avg_marked] > td", 'avg_marked[]' => 'TEXT',
-    process "tr[id=avg_fixed] > td", 'avg_fixed[]' => 'TEXT',
-    process "tr[id=not_marked] > td", 'not_marked[]' => 'TEXT',
-    process "tr[id=closed] > td", 'closed[]' => 'TEXT',
-    process "table[id=reports] > tr > td", 'report_lists[]' => scraper {
-        process 'ul > li', 'reports[]' => 'TEXT'
-    },
 };
 
-my $expected_cats = [ 'All', '-- Pick a category --', @cats ];
-my $res = $categories->scrape( $mech->content );
-is_deeply( $res->{cats}, $expected_cats, 'correct list of categories' );
+my $UPLOAD_DIR = tempdir( CLEANUP => 1 );
 
-foreach my $row ( @{ $res->{rows} }[1 .. 11] ) {
-    foreach my $col ( @{ $row->{cols} } ) {
-        is $col, 0;
+FixMyStreet::override_config {
+    ALLOWED_COBRANDS => 'no2fa',
+    COBRAND_FEATURES => { category_groups => { no2fa => 1 } },
+    MAPIT_URL => 'http://mapit.uk/',
+    PHOTO_STORAGE_OPTIONS => {
+        UPLOAD_DIR => $UPLOAD_DIR,
+    },
+}, sub {
+
+    subtest 'not logged in, redirected to login' => sub {
+        $mech->not_logged_in_ok;
+        $mech->get_ok('/dashboard');
+        $mech->content_contains( 'sign in' );
+    };
+
+    subtest 'normal user, 404' => sub {
+        $mech->log_in_ok( $normaluser->email );
+        $mech->get('/dashboard');
+        is $mech->status, '404', 'If not council user get 404';
+    };
+
+    subtest 'superuser, body list' => sub {
+        $mech->log_in_ok( $superuser->email );
+        $mech->get_ok('/dashboard');
+        # Contains body name, in list of bodies
+        $mech->content_contains('Some Other Council');
+        $mech->content_contains('Edinburgh Council');
+        $mech->content_lacks('Category:');
+        $mech->get_ok('/dashboard?body=' . $body->id);
+        $mech->content_lacks('Some Other Council');
+        $mech->content_contains('Edinburgh Council');
+        $mech->content_contains('Trowbridge');
+        $mech->content_contains('Category:');
+    };
+
+    subtest 'council user, ward list' => sub {
+        $mech->log_in_ok( $counciluser->email );
+        $mech->get_ok('/dashboard');
+        $mech->content_lacks('Some Other Council');
+        $mech->content_contains('Edinburgh Council');
+        $mech->content_contains('Trowbridge');
+        $mech->content_contains('Category:');
+    };
+
+    subtest 'area user can only see their area' => sub {
+        $counciluser->update({area_ids => [ $area_id ]});
+
+        $mech->get_ok("/dashboard");
+        $mech->content_contains('<h1>Trowbridge</h1>');
+        $mech->get_ok("/dashboard?body=" . $other_body->id);
+        $mech->content_contains('<h1>Trowbridge</h1>');
+        $mech->get_ok("/dashboard?ward=$alt_area_id");
+        $mech->content_contains('<h1>Trowbridge</h1>');
+
+        $counciluser->update({area_ids => [ $area_id, $alt_area_id ]});
+        $mech->get_ok("/dashboard");
+        $mech->content_contains('<h1>Bradford-on-Avon / Trowbridge</h1>');
+
+        $counciluser->update({area_ids => undef});
+    };
+
+    subtest 'The correct categories and totals shown by default' => sub {
+        $mech->get_ok("/dashboard");
+        my $expected_cats = [ 'All', 'Litter', 'Other', 'Traffic lights', 'Potholes' ];
+        my $res = $categories->scrape( $mech->content );
+        $mech->content_contains('<optgroup label="Road">');
+        is_deeply( $res->{cats}, $expected_cats, 'correct list of categories' );
+        # Three missing as more than a month ago
+        test_table($mech->content, 1, 0, 0, 1, 0, 0, 0, 0, 2, 0, 4, 6, 7, 3, 0, 10, 10, 3, 4, 17);
+    };
+
+    subtest 'test filters' => sub {
+        $mech->get_ok("/dashboard");
+        $mech->submit_form_ok({ with_fields => { category => 'Litter' } });
+        test_table($mech->content, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1);
+        $mech->submit_form_ok({ with_fields => { category => '', state => 'fixed - council' } });
+        test_table($mech->content, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 4, 4);
+        $mech->submit_form_ok({ with_fields => { state => 'action scheduled' } });
+        test_table($mech->content, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 7, 7, 0, 0, 7);
+        my $start = DateTime->now->subtract(months => 3)->strftime('%Y-%m-%d');
+        my $end = DateTime->now->subtract(months => 1)->strftime('%Y-%m-%d');
+        $mech->submit_form_ok({ with_fields => { state => '', start_date => $start, end_date => $end } });
+        test_table($mech->content, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 3, 3, 0, 0, 3);
+    };
+
+    subtest 'test grouping' => sub {
+        $mech->get_ok("/dashboard?group_by=category");
+        test_table($mech->content, 1, 0, 6, 10, 17);
+        $mech->get_ok("/dashboard?group_by=state");
+        test_table($mech->content, 3, 7, 4, 3, 17);
+        $mech->get_ok("/dashboard?start_date=2000-01-01&group_by=month");
+        test_table($mech->content, 0, 17, 17, 3, 0, 3, 3, 17, 20);
+    };
+
+    subtest 'export as csv' => sub {
+        $mech->create_problems_for_body(1, $body->id, 'Title', {
+            detail => "this report\nis split across\nseveral lines",
+            category => 'Problem one',
+            areas => ",$alt_area_id,2651,",
+        });
+        $mech->get_ok('/dashboard?export=1');
+        my @rows = $mech->content_as_csv;
+        is scalar @rows, 19, '1 (header) + 18 (reports) = 19 lines';
+
+        is scalar @{$rows[0]}, 21, '21 columns present';
+
+        is_deeply $rows[0],
+            [
+                'Report ID',
+                'Title',
+                'Detail',
+                'User Name',
+                'Category',
+                'Subcategory',
+                'Created',
+                'Confirmed',
+                'Acknowledged',
+                'Fixed',
+                'Closed',
+                'Status',
+                'Latitude',
+                'Longitude',
+                'Query',
+                'Ward',
+                'Easting',
+                'Northing',
+                'Report URL',
+                'Site Used',
+                'Reported As',
+            ],
+            'Column headers look correct';
+
+        is $rows[5]->[15], 'Trowbridge', 'Ward column is name not ID';
+        is $rows[5]->[16], '529025', 'Correct Easting conversion';
+        is $rows[5]->[17], '179716', 'Correct Northing conversion';
+    };
+
+    subtest 'export updates as csv' => sub {
+        $mech->get_ok('/dashboard?updates=1&export=1');
+        my @rows = $mech->content_as_csv;
+        is scalar @rows, 18, '1 (header) + 17 (updates) = 18 lines';
+        is scalar @{$rows[0]}, 8, '8 columns present';
+
+        is_deeply $rows[0],
+            [
+                'Report ID', 'Update ID', 'Date', 'Status', 'Problem state',
+                'Text', 'User Name', 'Reported As',
+            ],
+            'Column headers look correct';
+
+        is $rows[1]->[0], $first_problem_id, 'Correct report ID';
+        is $rows[1]->[1], $first_update_id, 'Correct update ID';
+        is $rows[1]->[3], 'confirmed', 'Correct state';
+        is $rows[1]->[4], 'action scheduled', 'Correct problem state';
+        is $rows[1]->[5], 'text', 'Correct text';
+        is $rows[1]->[6], 'Title', 'Correct name';
+    };
+
+    subtest 'export as csv using token' => sub {
+        $mech->log_out_ok;
+
+        my $u = FixMyStreet::DB->resultset("User")->new({ password => '1234567890abcdefgh' });
+        $counciluser->set_extra_metadata('access_token', $u->password);
+        $counciluser->update();
+
+        $mech->get_ok('/dashboard?export=1');
+        like $mech->res->header('Content-type'), qr'text/html';
+        $mech->content_lacks('Report ID');
+
+        $mech->add_header('Authorization', 'Bearer ' . $counciluser->id . '-1234567890abcdefgh');
+        $mech->get_ok('/dashboard?export=1');
+        like $mech->res->header('Content-type'), qr'text/csv';
+        $mech->content_contains('Report ID');
+        $mech->delete_header('Authorization');
+
+        my $token = 'access_token=' . $counciluser->id . '-1234567890abcdefgh';
+        $mech->get_ok("/dashboard?export=2&$token");
+        is $mech->res->code, 202;
+        my $loc = $mech->res->header('Location');
+        like $loc, qr{/dashboard/csv/.*\.csv$};
+        $mech->get_ok("$loc?$token");
+        like $mech->res->header('Content-type'), qr'text/csv';
+        $mech->content_contains('Report ID');
+    };
+
+    subtest 'view status page' => sub {
+        # Simulate a partly done file
+        my $f = Path::Tiny->tempfile(SUFFIX => '.csv-part', DIR => path($UPLOAD_DIR, 'dashboard_csv', $counciluser->id));
+        (my $name = $f->basename) =~ s/-part$//;;
+
+        my $token = 'access_token=' . $counciluser->id . '-1234567890abcdefgh';
+        $mech->get_ok("/dashboard/csv/$name?$token");
+        is $mech->res->code, 202;
+
+        $mech->log_in_ok( $counciluser->email );
+        $mech->get_ok('/dashboard/status');
+        $mech->content_contains('/dashboard/csv/www.example.org-body-' . $body->id . '-start_date-2014-01-02.csv');
+        $mech->content_like(qr/$name\s*<br>0KB\s*<i>In progress/);
+
+        $f->remove;
+        $mech->get_ok('/dashboard/status');
+        $mech->content_contains('/dashboard/csv/www.example.org-body-' . $body->id . '-start_date-2014-01-02.csv');
+        $mech->content_lacks('In progress');
+        $mech->content_lacks('setTimeout');
     }
-}
+};
 
-for my $reports ( @{ $res->{report_lists} } ) {
-    is_deeply $reports, {}, 'No reports';
-}
-
-foreach my $test (
-    {
-        desc => 'confirmed today with no state',
-        dt   => DateTime->now,
-        counts => [1,1,1,1],
-        report_counts => [1, 0, 0],
-    },
-    {
-        desc => 'confirmed last 7 days with no state',
-        dt   => DateTime->now->subtract( days => 6, hours => 23 ),
-        counts => [1,2,2,2],
-        report_counts => [2, 0, 0],
-    },
-    {
-        desc => 'confirmed last 8 days with no state',
-        dt   => DateTime->now->subtract( days => 8 ),
-        counts => [1,2,3,3],
-        report_counts => [2, 1, 0],
-    },
-    {
-        desc => 'confirmed last 4 weeks with no state',
-        dt   => DateTime->now->subtract( weeks => 2 ),
-        counts => [1,2,4,4],
-        report_counts => [2, 1, 1],
-    },
-    {
-        desc => 'confirmed this year with no state',
-        dt   => DateTime->now->subtract( weeks => 7 ),
-        counts => [1,2,4,5],
-        report_counts => [2, 1, 1],
-    },
-) {
-    subtest $test->{desc} => sub {
-        make_problem( { state => 'confirmed', conf_dt => $test->{dt} } );
-
-        $mech->get_ok('/dashboard');
-        $res = $categories->scrape( $mech->content );
-
-        check_row( $res, 'totals', $test->{counts} );
-        check_row( $res, 'not_marked', $test->{counts} );
-
-        check_report_counts( $res, $test->{report_counts} );
+FixMyStreet::override_config {
+    ALLOWED_COBRANDS => 'tester',
+    MAPIT_URL => 'http://mapit.uk/',
+}, sub {
+    subtest 'no body or export, 404' => sub {
+        $mech->get('/dashboard');
+        is $mech->status, '404', 'No parameters, 404';
+        $mech->get('/dashboard?export=1');
+        is $mech->status, '404', 'If no body, 404';
+        $mech->get("/dashboard?body=$body_id");
+        is $mech->status, '404', 'If no export, 404';
     };
-}
 
-delete_problems();
-
-my $is_monday = DateTime->now->day_of_week == 1 ? 1 : 0;
-
-foreach my $test (
-    {
-        desc => 'user fixed today',
-        confirm_dt   => DateTime->now->subtract( days => 1 ),
-        mark_dt      => DateTime->now,
-        state => 'fixed - user',
-        counts => {
-            totals => $is_monday ? [0,1,1,1] : [1,1,1,1],
-            user => [1,1,1,1],
-            council => [0,0,0,0],
-            avg_fixed => [0,0,0,0],
-            total_fixed => [1,1,1,1],
-        }
-    },
-    {
-        desc => 'council fixed today',
-        confirm_dt   => DateTime->now->subtract( days => 1 ),
-        mark_dt      => DateTime->now,
-        state => 'fixed - council',
-        counts => {
-            totals => $is_monday ? [0,2,2,2] : [2,2,2,2],
-            user => [1,1,1,1],
-            council => [1,1,1,1],
-            avg_fixed => [1,1,1,1],
-            total_fixed => [2,2,2,2],
-        }
-    },
-    {
-        desc => 'marked investigating today',
-        confirm_dt   => DateTime->now->subtract( days => 1 ),
-        mark_dt      => DateTime->now,
-        state => 'investigating',
-        counts => {
-            totals => $is_monday ? [0,3,3,3] : [3,3,3,3],
-            user => [1,1,1,1],
-            council => [1,1,1,1],
-            total_fixed => [2,2,2,2],
-            avg_marked => [1,1,1,1],
-            investigating => [1,1,1,1],
-            marked => [1,1,1,1]
-        }
-    },
-    {
-        desc => 'marked in progress today',
-        confirm_dt   => DateTime->now->subtract( days => 1 ),
-        mark_dt      => DateTime->now,
-        state => 'in progress',
-        counts => {
-            totals => $is_monday ? [0,4,4,4] : [4,4,4,4],
-            user => [1,1,1,1],
-            council => [1,1,1,1],
-            total_fixed => [2,2,2,2],
-            avg_marked => [1,1,1,1],
-            investigating => [1,1,1,1],
-            in_progress => [1,1,1,1],
-            marked => [2,2,2,2]
-        }
-    },
-    {
-        desc => 'marked as action scheduled today',
-        confirm_dt   => DateTime->now->subtract( days => 1 ),
-        mark_dt      => DateTime->now,
-        state => 'action scheduled',
-        counts => {
-            totals => $is_monday ? [ 0,5,5,5] : [5,5,5,5],
-            user => [1,1,1,1],
-            council => [1,1,1,1],
-            total_fixed => [2,2,2,2],
-            avg_marked => [1,1,1,1],
-            investigating => [1,1,1,1],
-            in_progress => [1,1,1,1],
-            action_scheduled => [1,1,1,1],
-            marked => [3,3,3,3]
-        }
-    },
-    {
-        desc => 'marked as action scheduled today, confirmed a week ago',
-        confirm_dt   => DateTime->now->subtract( days => 8 ),
-        mark_dt      => DateTime->now,
-        state => 'action scheduled',
-        counts => {
-            totals => $is_monday ? [0,5,6,6] : [5,5,6,6],
-            user => [1,1,1,1],
-            council => [1,1,1,1],
-            total_fixed => [2,2,2,2],
-            avg_marked => [3,3,3,3],
-            investigating => [1,1,1,1],
-            in_progress => [1,1,1,1],
-            action_scheduled => [2,2,2,2],
-            marked => [4,4,4,4]
-        }
-    },
-    {
-        desc => 'marked as council fixed today, confirmed a week ago',
-        confirm_dt   => DateTime->now->subtract( days => 8 ),
-        mark_dt      => DateTime->now,
-        state => 'fixed - council',
-        counts => {
-            totals => $is_monday ? [0,5,7,7] : [5,5,7,7],
-            user => [1,1,1,1],
-            council => [2,2,2,2],
-            total_fixed => [3,3,3,3],
-            avg_fixed => [5,5,5,5],
-            avg_marked => [3,3,3,3],
-            investigating => [1,1,1,1],
-            in_progress => [1,1,1,1],
-            action_scheduled => [2,2,2,2],
-            marked => [4,4,4,4]
-        }
-    },
-    {
-        desc => 'marked as council fixed a week ago, confirmed 3 weeks ago',
-        confirm_dt   => DateTime->now->subtract( days => 21),
-        mark_dt      => DateTime->now->subtract( days => 8 ),
-        state => 'fixed - council',
-        counts => {
-            totals => $is_monday ? [0,5,8,8] : [5,5,8,8],
-            user => [1,1,1,1],
-            council => [2,2,3,3],
-            total_fixed => [3,3,4,4],
-            avg_fixed => [5,5,7,7],
-            avg_marked => [3,3,3,3],
-            investigating => [1,1,1,1],
-            in_progress => [1,1,1,1],
-            action_scheduled => [2,2,2,2],
-            marked => [4,4,4,4]
-        }
-    },
-    {
-        desc => 'marked as user fixed 6 weeks ago, confirmed 7 weeks ago',
-        confirm_dt   => DateTime->now->subtract( weeks => 6 ),
-        mark_dt      => DateTime->now->subtract( weeks => 7 ),
-        state => 'fixed - user',
-        counts => {
-            totals => $is_monday ? [0,5,8,9] : [5,5,8,9],
-            user => [1,1,1,2],
-            council => [2,2,3,3],
-            total_fixed => [3,3,4,5],
-            avg_fixed => [5,5,7,7],
-            avg_marked => [3,3,3,3],
-            investigating => [1,1,1,1],
-            in_progress => [1,1,1,1],
-            action_scheduled => [2,2,2,2],
-            marked => [4,4,4,4]
-        }
-    },
-    {
-        desc => 'marked as closed',
-        confirm_dt   => DateTime->now->subtract( days => 1 ),
-        mark_dt      => DateTime->now,
-        state => 'closed',
-        counts => {
-            totals => $is_monday ? [0,6,9,10] : [6,6,9,10],
-            user => [1,1,1,2],
-            council => [2,2,3,3],
-            total_fixed => [3,3,4,5],
-            avg_fixed => [5,5,7,7],
-            avg_marked => [2,2,2,2],
-            investigating => [1,1,1,1],
-            in_progress => [1,1,1,1],
-            action_scheduled => [2,2,2,2],
-            closed => [1,1,1,1],
-            marked => [5,5,5,5]
-        }
-    },
-    {
-        desc => 'marked as planned',
-        confirm_dt   => DateTime->now->subtract( days => 1 ),
-        mark_dt      => DateTime->now,
-        state => 'planned',
-        counts => {
-            totals => $is_monday ? [0,7,10,11] : [7,7,10,11],
-            user => [1,1,1,2],
-            council => [2,2,3,3],
-            total_fixed => [3,3,4,5],
-            avg_fixed => [5,5,7,7],
-            avg_marked => [2,2,2,2],
-            investigating => [1,1,1,1],
-            in_progress => [1,1,1,1],
-            action_scheduled => [3,3,3,3],
-            closed => [1,1,1,1],
-            marked => [6,6,6,6]
-        }
-    },
-) {
-    subtest $test->{desc} => sub {
-        make_problem(
-            {
-                state   => $test->{state},
-                conf_dt => $test->{confirm_dt},
-                mark_dt => $test->{mark_dt},
-            }
-        );
-
-        $mech->get_ok('/dashboard');
-        $res = $categories->scrape( $mech->content );
-
-        foreach my $row ( keys %{ $test->{counts} } ) {
-            check_row( $res, $row, $test->{counts}->{$row} );
-        }
+    subtest 'body and export, okay' => sub {
+        $mech->get_ok("/dashboard?body=$body_id&export=1");
     };
-}
+};
 
-delete_problems();
-
-for my $test (
-    {
-        desc => 'Selecting no category does nothing',
-        p1 => {
-                state   => 'confirmed',
-                conf_dt => DateTime->now(),
-                category => 'Potholes',
-        },
-        p2 => {
-                state   => 'confirmed',
-                conf_dt => DateTime->now(),
-                category => 'Litter',
-        },
-        category => '',
-        counts => {
-            totals => [2,2,2,2],
-        },
-        counts_after => {
-            totals => [2,2,2,2],
-        },
-        report_counts => [2,0,0],
-        report_counts_after => [2,0,0],
-    },
-    {
-        desc => 'Limit display by category',
-        category => 'Potholes',
-        counts => {
-            totals => [2,2,2,2],
-        },
-        counts_after => {
-            totals => [1,1,1,1],
-        },
-        report_counts => [2,0,0],
-        report_counts_after => [1,0,0],
-    },
-    {
-        desc => 'Limit display for category with no entries',
-        category => 'Grafitti',
-        counts => {
-            totals => [2,2,2,2],
-        },
-        counts_after => {
-            totals => [0,0,0,0],
-        },
-        report_counts => [2,0,0],
-        report_counts_after => [0,0,0],
-    },
-    {
-        desc => 'Limit display by category for council fixed',
-        p1 => {
-                state   => 'fixed - council',
-                conf_dt => DateTime->now()->subtract( weeks => 1 ),
-                mark_dt => DateTime->now()->subtract( weeks => 1 ),
-                category => 'Potholes',
-        },
-        p2 => {
-                state   => 'fixed - council',
-                conf_dt => DateTime->now()->subtract( weeks => 1 ),
-                mark_dt => DateTime->now()->subtract( weeks => 1 ),
-                category => 'Litter',
-        },
-        category => 'Potholes',
-        counts => {
-            council => [0,0,2,2],
-            totals => [2,2,4,4],
-        },
-        counts_after => {
-            council => [0,0,1,1],
-            totals => [1,1,2,2],
-        },
-        report_counts => [2,2,0],
-        report_counts_after => [1,1,0],
-    },
-    {
-        desc => 'Limit display by category for user fixed',
-        p1 => {
-                state   => 'fixed - user',
-                conf_dt => DateTime->now()->subtract( weeks => 1 ),
-                mark_dt => DateTime->now()->subtract( weeks => 1 ),
-                category => 'Potholes',
-        },
-        p2 => {
-                state   => 'fixed - user',
-                conf_dt => DateTime->now()->subtract( weeks => 1 ),
-                mark_dt => DateTime->now()->subtract( weeks => 1 ),
-                category => 'Litter',
-        },
-        category => 'Potholes',
-        counts => {
-            user => [0,0,2,2],
-            council => [0,0,2,2],
-            totals => [2,2,6,6],
-        },
-        counts_after => {
-            user => [0,0,1,1],
-            council => [0,0,1,1],
-            totals => [1,1,3,3],
-        },
-        report_counts => [2,4,0],
-        report_counts_after => [1,2,0],
-    },
-    {
-        desc => 'Limit display by ward',
-        p1 => {
-                state   => 'confirmed',
-                conf_dt => DateTime->now()->subtract( weeks => 1 ),
-                category => 'Potholes',
-                # in real life it has commas around it and the search
-                # uses them
-                areas => ',20720,',
-        },
-        p2 => {
-                state   => 'fixed - council',
-                conf_dt => DateTime->now()->subtract( weeks => 1 ),
-                mark_dt => DateTime->now()->subtract( weeks => 1 ),
-                category => 'Litter',
-                areas => ',20720,',
-        },
-        ward => 20720,
-        counts => {
-            user => [0,0,2,2],
-            council => [0,0,3,3],
-            totals => [2,2,8,8],
-        },
-        counts_after => {
-            user => [0,0,0,0],
-            council => [0,0,1,1],
-            totals => [0,0,2,2],
-        },
-        report_counts => [2,6,0],
-        report_counts_after => [0,2,0],
-    },
-) {
-    subtest $test->{desc} => sub {
-        make_problem( $test->{p1} ) if $test->{p1};
-        make_problem( $test->{p2} ) if $test->{p2};
-
-        $mech->get_ok('/dashboard');
-
-        $res = $categories->scrape( $mech->content );
-
-        foreach my $row ( keys %{ $test->{counts} } ) {
-            check_row( $res, $row, $test->{counts}->{$row} );
-        }
-
-        check_report_counts( $res, $test->{report_counts} );
-
-        $mech->submit_form_ok( {
-            with_fields => {
-                category => $test->{category},
-                ward     => $test->{ward},
-            }
-        } );
-
-        $res = $categories->scrape( $mech->content );
-
-        foreach my $row ( keys %{ $test->{counts_after} } ) {
-            check_row( $res, $row, $test->{counts_after}->{$row} );
-        }
-        check_report_counts( $res, $test->{report_counts_after} );
-    };
-}
-
-delete_problems();
-
-for my $test (
-    {
-        desc => 'Selecting no state does nothing',
-        p1 => {
-                state   => 'fixed - user',
-                conf_dt => DateTime->now(),
-                category => 'Potholes',
-        },
-        p2 => {
-                state   => 'confirmed',
-                conf_dt => DateTime->now(),
-                category => 'Litter',
-        },
-        state => '',
-        report_counts => [2,0,0],
-        report_counts_after => [2,0,0],
-    },
-    {
-        desc => 'limit by state works',
-        state => 'fixed',
-        report_counts => [2,0,0],
-        report_counts_after => [1,0,0],
-    },
-    {
-        desc => 'planned counted as action scheduled',
-        p1 => {
-                state   => 'planned',
-                conf_dt => DateTime->now(),
-                category => 'Potholes',
-        },
-        state => 'action scheduled',
-        report_counts => [3,0,0],
-        report_counts_after => [1,0,0],
-    },
-    {
-        desc => 'All fixed states count as fixed',
-        p1 => {
-                state   => 'fixed - council',
-                conf_dt => DateTime->now(),
-                category => 'Potholes',
-        },
-        p2 => {
-                state   => 'fixed',
-                conf_dt => DateTime->now(),
-                category => 'Potholes',
-        },
-        state => 'fixed',
-        report_counts => [5,0,0],
-        report_counts_after => [3,0,0],
-    },
-) {
-    subtest $test->{desc} => sub {
-        make_problem( $test->{p1} ) if $test->{p1};
-        make_problem( $test->{p2} ) if $test->{p2};
-
-        $mech->get_ok('/dashboard');
-
-        $res = $categories->scrape( $mech->content );
-
-        check_report_counts( $res, $test->{report_counts} );
-
-        $mech->submit_form_ok( {
-            with_fields => {
-                state => $test->{state},
-            }
-        } );
-
-        $res = $categories->scrape( $mech->content );
-
-        check_report_counts( $res, $test->{report_counts_after} );
-    };
-}
-
-sub make_problem {
-    my $args = shift;
-
-    my $p = FixMyStreet::App->model('DB::Problem')->create( {
-        title => 'a problem',
-        name => 'a user',
-        anonymous => 1,
-        detail => 'some detail',
-        state => $args->{state},
-        confirmed => $args->{conf_dt},
-        whensent => $args->{conf_dt},
-        lastupdate => $args->{mark_dt} || $args->{conf_dt},
-        bodies_str => $test_council,
-        postcode => 'EH99 1SP',
-        latitude => '51',
-        longitude => '1',
-        areas      => $args->{areas} || $test_ward,
-        used_map => 0,
-        user_id => $p_user->id,
-        category => $args->{category} || 'Other',
-    } );
-
-    if ( $args->{state} ne 'confirmed' ) {
-        my $c = FixMyStreet::App->model('DB::Comment')->create( {
-            problem => $p,
-            user_id => $p_user->id,
-            state => 'confirmed',
-            problem_state => $args->{state} =~ /^fixed - user|fixed$/ ? undef : $args->{state},
-            confirmed => $args->{mark_dt},
-            text => 'an update',
-            mark_fixed => $args->{state} =~ /fixed/ ? 1 : 0,
-            anonymous => 1,
-        } );
+sub test_table {
+    my ($content, @expected) = @_;
+    my $res = $categories->scrape( $mech->content );
+    my @actual;
+    foreach my $row ( @{ $res->{rows} }[1 .. 11] ) {
+        push @actual, @{$row->{cols}} if $row->{cols};
     }
+    is_deeply \@actual, \@expected;
 }
 
-sub check_row {
-    my $res = shift;
-    my $row = shift;
-    my $totals = shift;
-
-    is $res->{ $row }->[0], $totals->[0], "Correct count in $row for WTD";
-    is $res->{ $row }->[1], $totals->[1], "Correct count in $row for last 7 days";
-    is $res->{ $row }->[2], $totals->[2], "Correct count in $row for last 4 weeks";
-    is $res->{ $row }->[3], $totals->[3], "Correct count in $row for YTD";
-}
-
-sub check_report_counts {
-    my $res = shift;
-    my $counts = shift;
-
-    for my $i ( 0 .. 2 ) {
-        if ( $counts->[$i] == 0 ) {
-            is_deeply $res->{report_lists}->[$i], {}, "No reports for column $i";
-        } else {
-            if ( ref( $res->{report_lists}->[$i]->{reports} ) eq 'ARRAY' ) {
-                is scalar @{ $res->{report_lists}->[$i]->{reports} }, $counts->[$i], "Correct report count for column $i";
-            } else {
-                fail "Correct report count for column $i ( no reports )";
-            }
-        }
-    }
-}
-
-sub delete_problems {
-    FixMyStreet::App->model('DB::Comment')
-      ->search( { 'problem.bodies_str' => $test_council }, { join => 'problem' } )
-      ->delete;
-    FixMyStreet::App->model('DB::Problem')
-      ->search( { bodies_str => $test_council } )->delete();
-}
-
-done_testing;
+restore_time;
+done_testing();

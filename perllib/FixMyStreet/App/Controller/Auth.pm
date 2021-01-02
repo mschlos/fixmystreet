@@ -5,9 +5,11 @@ use namespace::autoclean;
 BEGIN { extends 'Catalyst::Controller'; }
 
 use Email::Valid;
-use Net::Domain::TLD;
-use mySociety::AuthToken;
-use JSON;
+use Data::Password::Common 'found';
+use Digest::HMAC_SHA1 qw(hmac_sha1);
+use JSON::MaybeXS;
+use MIME::Base64;
+use FixMyStreet::SMS;
 
 =head1 NAME
 
@@ -28,21 +30,67 @@ Present the user with a sign in / create account page.
 
 sub general : Path : Args(0) {
     my ( $self, $c ) = @_;
-    my $req = $c->req;
 
-    $c->detach( 'redirect_on_signin', [ $req->param('r') ] )
-        if $c->user && $req->param('r') && $req->param('r') !~ /admin/;
+    $c->detach( 'redirect_on_signin', [ $c->get_param('r') ] )
+        if $c->req->method eq 'GET' && $c->user && $c->get_param('r');
 
     # all done unless we have a form posted to us
-    return unless $req->method eq 'POST';
+    return unless $c->req->method eq 'POST';
+
+    my $clicked_sign_in_by_code = $c->get_param('sign_in_by_code');
+    my $data_username = $c->get_param('username');
+    my $data_password = $c->get_param('password_sign_in');
+    my $data_email = $c->get_param('name') || $c->get_param('password_register');
 
     # decide which action to take
-    $c->detach('email_sign_in') if $req->param('email_sign_in')
-        || $c->req->param('name') || $c->req->param('password_register');
+    $c->detach('code_sign_in') if $clicked_sign_in_by_code || ($data_email && !$data_password);
+    if (!$data_username && !$data_password && !$data_email && $c->get_param('social_sign_in')) {
+        $c->forward('social/handle_sign_in');
+    }
 
-       $c->forward( 'sign_in' )
-    && $c->detach( 'redirect_on_signin', [ $req->param('r') ] );
+    $c->forward( 'sign_in', [ $data_username ] )
+        && $c->detach( 'redirect_on_signin', [ $c->get_param('r') ] );
 
+}
+
+sub create : Path('create') : Args(0) {
+    my ( $self, $c ) = @_;
+    return unless $c->req->method eq 'POST';
+    $c->detach('code_sign_in');
+}
+
+sub forgot : Path('forgot') : Args(0) {
+    my ( $self, $c ) = @_;
+    $c->stash->{forgotten} = 1;
+    $c->stash->{template} = 'auth/create.html';
+    return unless $c->req->method eq 'POST';
+    $c->detach('code_sign_in');
+}
+
+sub expired : Path('expired') : Args(0) {
+    my ( $self, $c ) = @_;
+
+    $c->detach('/page_error_403_access_denied', []) unless $c->user_exists;
+
+    my $expiry = $c->cobrand->call_hook('password_expiry');
+    $c->detach('/page_error_403_access_denied', []) unless $expiry;
+
+    my $last_change = $c->user->get_extra_metadata('last_password_change') || 0;
+    my $midnight = int(time()/86400)*86400;
+    my $expired = $last_change + $expiry < $midnight;
+    $c->detach('/page_error_403_access_denied', []) unless $expired;
+
+    $c->stash->{expired_password} = 1;
+    $c->stash->{template} = 'auth/create.html';
+    return unless $c->req->method eq 'POST';
+    $c->detach('code_sign_in', [ $c->user->email ]);
+}
+
+sub authenticate : Private {
+    my ($self, $c, $type, $username, $password) = @_;
+    return 1 if $type eq 'email' && $c->authenticate({ email => $username, email_verified => 1, password => $password });
+    return 1 if FixMyStreet->config('SMS_AUTHENTICATION') && $type eq 'phone' && $c->authenticate({ phone => $username, phone_verified => 1, password => $password });
+    return 0;
 }
 
 =head2 sign_in
@@ -52,48 +100,64 @@ Allow the user to sign in with a username and a password.
 =cut
 
 sub sign_in : Private {
-    my ( $self, $c, $email ) = @_;
+    my ( $self, $c, $username ) = @_;
 
-    $email        ||= $c->req->param('email')            || '';
-    my $password    = $c->req->param('password_sign_in') || '';
-    my $remember_me = $c->req->param('remember_me')      || 0;
+    $username ||= '';
+    my $password = $c->get_param('password_sign_in') || '';
 
     # Sign out just in case
     $c->logout();
 
-    if (   $email
-        && $password
-        && $c->authenticate( { email => $email, password => $password } ) )
-    {
+    my $parsed = FixMyStreet::SMS->parse_username($username);
 
-        # unless user asked to be remembered limit the session to browser
-        $c->set_session_cookie_expire(0)
-          unless $remember_me;
+    if ($parsed->{username} && $password && $c->forward('authenticate', [ $parsed->{type}, $parsed->{username}, $password ])) {
+        # Upgrade hash count if necessary
+        my $cost = sprintf("%02d", FixMyStreet::DB::Result::User->cost);
+        if ($c->user->password !~ /^\$2a\$$cost\$/) {
+            $c->user->update({ password => $password });
+        }
+
+        # Regenerate CSRF token as session ID changed
+        $c->forward('get_csrf_token');
 
         return 1;
     }
 
     $c->stash(
         sign_in_error => 1,
-        email => $email,
-        remember_me => $remember_me,
+        username => $username,
     );
     return;
 }
 
-=head2 email_sign_in
+=head2 code_sign_in
 
-Email the user the details they need to sign in. Don't check for an account - if
-there isn't one we can create it when they come back with a token (which
-contains the email addresss).
+Either email the user a link to sign in, or send an SMS token to do so.
+
+Don't check for an account - if there isn't one we can create it when
+they come back with a token (which contains the email/phone).
 
 =cut
 
+sub code_sign_in : Private {
+    my ( $self, $c, $override_username ) = @_;
+
+    my $username = $c->stash->{username} = $override_username || $c->get_param('username') || '';
+
+    my $parsed = FixMyStreet::SMS->parse_username($username);
+
+    if ($parsed->{type} eq 'phone' && FixMyStreet->config('SMS_AUTHENTICATION')) {
+        $c->forward('phone/sign_in', [ $parsed ]);
+    } else {
+        $c->forward('email_sign_in', [ $parsed->{username} ]);
+    }
+}
+
 sub email_sign_in : Private {
-    my ( $self, $c ) = @_;
+    my ( $self, $c, $email ) = @_;
 
     # check that the email is valid - otherwise flag an error
-    my $raw_email = lc( $c->req->param('email') || '' );
+    my $raw_email = lc( $email || '' );
 
     my $email_checker = Email::Valid->new(
         -mxcheck  => 1,
@@ -103,33 +167,80 @@ sub email_sign_in : Private {
 
     my $good_email = $email_checker->address($raw_email);
     if ( !$good_email ) {
-        $c->stash->{email} = $raw_email;
-        $c->stash->{email_error} =
-          $raw_email ? $email_checker->details : 'missing';
+        $c->stash->{username_error} = $raw_email ? $email_checker->details : 'missing_email';
+        return;
+    }
+
+    my $password = $c->get_param('password_register');
+    if ($password) {
+        return unless $c->forward('/auth/test_password', [ $password ]);
+    }
+
+    # If user registration is disabled then bail out at this point
+    # if there's not already a user with this email address.
+    # NB this uses the same template as a successful sign in to stop
+    # enumeration of valid email addresses.
+    if ( FixMyStreet->config('SIGNUPS_DISABLED')
+         && !$c->model('DB::User')->find({ email => $good_email })
+         && !$c->stash->{current_user} # don't break the change email flow
+    ) {
+        $c->stash->{template} = 'auth/token.html';
         return;
     }
 
     my $user_params = {};
-    $user_params->{password} = $c->req->param('password_register')
-        if $c->req->param('password_register');
+    $user_params->{password} = $password if $password;
     my $user = $c->model('DB::User')->new( $user_params );
 
-    my $token_obj = $c->model('DB::Token')    #
-      ->create(
-        {
-            scope => 'email_sign_in',
-            data  => {
-                email => $good_email,
-                r => $c->req->param('r'),
-                name => $c->req->param('name'),
-                password => $user->password,
-            }
-        }
-      );
+    my $token_data = {
+        email => $good_email,
+        r => $c->get_param('r'),
+        name => $c->get_param('name'),
+        password => $user->password,
+    };
+
+    if ($c->get_param('oauth_need_email')) {
+        $token_data->{name} = $c->session->{oauth}{name}
+            if $c->session->{oauth}{name} && !$token_data->{name};
+        $c->forward('set_oauth_token_data', [ $token_data ]);
+    }
+
+    if ($c->stash->{current_user}) {
+        $token_data->{old_user_id} = $c->stash->{current_user}->id;
+        $token_data->{r} = 'auth/change_email/success';
+    }
+
+    my $token_obj = $c->model('DB::Token')->create({
+        scope => 'email_sign_in',
+        data  => $token_data,
+    });
 
     $c->stash->{token} = $token_obj->token;
-    $c->send_email( 'login.txt', { to => $good_email } );
+    my $template = $c->stash->{email_template} || 'login.txt';
+    $c->send_email( $template, { to => $good_email } );
     $c->stash->{template} = 'auth/token.html';
+}
+
+sub get_token : Private {
+    my ( $self, $c, $token, $scope ) = @_;
+
+    $c->stash->{token_not_found} = 1, return unless $token;
+
+    my $token_obj = $c->model('DB::Token')->find({ scope => $scope, token => $token });
+
+    $c->stash->{token_not_found} = 1, return unless $token_obj;
+    $c->stash->{token_not_found} = 1, return if $token_obj->created < DateTime->now->subtract( days => 1 );
+
+    my $data = $token_obj->data;
+    return $data;
+}
+
+sub set_oauth_token_data : Private {
+    my ( $self, $c, $token_data ) = @_;
+
+    foreach (qw/facebook_id twitter_id oidc_id extra logout_redirect_uri change_password_uri/) {
+        $token_data->{$_} = $c->session->{oauth}{$_} if $c->session->{oauth}{$_};
+    }
 }
 
 =head2 token
@@ -142,34 +253,127 @@ Handle the 'email_sign_in' tokens. Find the account for the email address
 sub token : Path('/M') : Args(1) {
     my ( $self, $c, $url_token ) = @_;
 
-    # retrieve the token or return
-    my $token_obj = $url_token
-      ? $c->model('DB::Token')->find( {
-          scope => 'email_sign_in', token => $url_token
-        } )
-      : undef;
+    my $data = $c->forward('get_token', [ $url_token, 'email_sign_in' ]) || return;
 
-    if ( !$token_obj ) {
-        $c->stash->{token_not_found} = 1;
-        return;
-    }
+    $c->stash->{token_not_found} = 1, return
+        if $data->{old_user_id} && $data->{r} && $data->{r} eq 'auth/change_email/success'
+            && (!$c->user_exists || $c->user->id ne $data->{old_user_id});
 
-    # Sign out in case we are another user
+    my $type = $data->{login_type} || 'email';
+    $c->detach( '/auth/process_login', [ $data, $type, $url_token ] );
+}
+
+sub process_login : Private {
+    my ( $self, $c, $data, $type, $url_token ) = @_;
+
+    # sign out in case we are another user
     $c->logout();
 
-    # get the email and scrap the token
-    my $data = $token_obj->data;
-    $token_obj->delete;
+    my $user = $c->model('DB::User')->find_or_new({ $type => $data->{$type} });
+    my $ver = "${type}_verified";
 
-    # find or create the user related to the token.
-    my $user = $c->model('DB::User')->find_or_create( { email => $data->{email} } );
+    # Bail out if this is a new user and SIGNUPS_DISABLED is set
+    $c->detach( '/page_error_403_access_denied', [] )
+        if FixMyStreet->config('SIGNUPS_DISABLED') && !$user->in_storage && !$data->{old_user_id};
+
+    # People using 2FA need to supply a code
+    my $must_have_2fa = $c->cobrand->call_hook('must_have_2fa', $user) || '';
+    if ($must_have_2fa ne 'skip') {
+        if ($user->has_2fa) {
+            $c->forward( 'token_2fa', [ $user, $url_token ] );
+        } elsif ($c->cobrand->call_hook('must_have_2fa', $user)) {
+            $c->forward( 'signup_2fa', [ $user ] );
+        }
+    }
+
+    if ($data->{old_user_id}) {
+        # Were logged in as old_user_id, want to switch to $user
+        if ($user->in_storage) {
+            my $old_user = $c->model('DB::User')->find({ id => $data->{old_user_id} });
+            if ($old_user) {
+                $old_user->adopt($user);
+                $user = $old_user;
+                $user->$type($data->{$type});
+                $user->$ver(1);
+            }
+        } else {
+            # Updating to a new (to the db) email address/phone number, easier!
+            $user = $c->model('DB::User')->find({ id => $data->{old_user_id} });
+            $user->$type($data->{$type});
+            $user->$ver(1);
+        }
+    }
+
     $user->name( $data->{name} ) if $data->{name};
     $user->password( $data->{password}, 1 ) if $data->{password};
-    $user->update;
-    $c->authenticate( { email => $user->email }, 'no_password' );
+    $user->facebook_id( $data->{facebook_id} ) if $data->{facebook_id};
+    $user->twitter_id( $data->{twitter_id} ) if $data->{twitter_id};
+    $user->add_oidc_id( $data->{oidc_id} ) if $data->{oidc_id};
+    $user->extra({
+        %{ $user->get_extra() },
+        %{ $data->{extra} }
+    }) if $data->{extra};
+
+    $user->update_or_insert;
+    $c->authenticate( { $type => $data->{$type}, $ver => 1 }, 'no_password' );
+
+    foreach (qw/logout_redirect_uri change_password_uri/) {
+        if ($data->{$_}) {
+            $c->session->{oauth} ||= ();
+            $c->session->{oauth}{$_} = $data->{$_};
+        }
+    }
+
 
     # send the user to their page
-    $c->detach( 'redirect_on_signin', [ $data->{r} ] );
+    $c->detach( 'redirect_on_signin', [ $data->{r}, $data->{p} ] );
+}
+
+=head2 token_2fa
+
+Used after clicking an email token link to request a 2FA code
+
+=cut
+
+sub token_2fa : Private {
+    my ($self, $c, $user, $url_token) = @_;
+
+    return if $c->check_2fa($user->has_2fa);
+
+    $c->stash->{form_action} = $c->req->path;
+    $c->stash->{token} = $url_token;
+    $c->stash->{template} = 'auth/2fa/form.html';
+    $c->detach;
+}
+
+sub signup_2fa : Private {
+    my ($self, $c, $user) = @_;
+
+    $c->stash->{form_action} = $c->req->path;
+    $c->stash->{template} = 'auth/2fa/intro.html';
+    my $action = $c->get_param('2fa_action') || '';
+
+    my $secret;
+    if ($action eq 'confirm') {
+        $secret = $c->get_param('secret32');
+        if ($c->check_2fa($secret)) {
+            $user->set_extra_metadata('2fa_secret' => $secret);
+            $user->update;
+            $c->stash->{stage} = 'success';
+            return;
+        } else {
+            $action = 'activate'; # Incorrect code, reshow
+        }
+    }
+
+    if ($action eq 'activate') {
+        my $auth = FixMyStreet::Auth::GoogleAuth->new;
+        $c->stash->{qr_code} = $auth->qr_code($secret, $user->email, $c->cobrand->base_url);
+        $c->stash->{secret32} = $auth->secret32;
+        $c->stash->{stage} = 'activate';
+    }
+
+    $c->detach;
 }
 
 =head2 redirect_on_signin
@@ -180,9 +384,28 @@ Used after signing in to take the person back to where they were.
 
 
 sub redirect_on_signin : Private {
-    my ( $self, $c, $redirect ) = @_;
-    $redirect = 'my' unless $redirect;
-    $c->res->redirect( $c->uri_for( "/$redirect" ) );
+    my ( $self, $c, $redirect, $params ) = @_;
+
+    if ($c->stash->{detach_to}) {
+        $c->detach($c->stash->{detach_to}, $c->stash->{detach_args});
+    }
+
+    unless ( $redirect ) {
+        my $inspector = $c->user->from_body && (
+            scalar @{ $c->user->categories } ||
+            scalar @{ $c->user->area_ids || [] }
+        );
+        $redirect = $inspector ? 'my/inspector_redirect' : 'my';
+    }
+    $redirect = 'my' if $redirect =~ /^admin/ && !$c->cobrand->admin_allow_user($c->user);
+    if ( $c->cobrand->moniker eq 'zurich' ) {
+        $redirect = 'admin' if $c->user->from_body;
+    }
+    if (defined $params) {
+        $c->res->redirect( $c->uri_for( "/$redirect", $params ) );
+    } else {
+        $c->res->redirect( $c->uri_for( "/$redirect" ) );
+    }
 }
 
 =head2 redirect
@@ -200,44 +423,114 @@ sub redirect : Private {
 
 }
 
-=head2 change_password
+sub get_csrf_token : Private {
+    my ( $self, $c ) = @_;
 
-Let the user change their password.
+    my $time = $c->stash->{csrf_time} || time();
+    my $hash = hmac_sha1("$time-" . ($c->sessionid || ""), $c->model('DB::Secret')->get);
+    $hash = encode_base64($hash, "");
+    $hash =~ s/=$//;
+    my $token = "$time-$hash";
+    $c->stash->{csrf_token} = $token unless $c->stash->{csrf_time};
+    return $token;
+}
+
+sub check_csrf_token : Private {
+    my ( $self, $c ) = @_;
+
+    my $token = $c->get_param('token') || "";
+    $token =~ s/ /+/g;
+    my ($time) = $token =~ /^(\d+)-[0-9a-zA-Z+\/]+$/;
+    $c->stash->{csrf_time} = $time;
+    my $gen_token = $c->forward('get_csrf_token');
+    delete $c->stash->{csrf_time};
+    $c->detach('no_csrf_token')
+        unless $time
+            && $time > time() - 3600
+            && $token eq $gen_token;
+
+    # Also check recaptcha if needed
+    $c->cobrand->call_hook('check_recaptcha');
+}
+
+sub no_csrf_token : Private {
+    my ($self, $c) = @_;
+    $c->detach('/page_error_400_bad_request', []);
+}
+
+=item common_password
+
+Returns 1/0 depending on if password is common/breached or not.
 
 =cut
 
-sub change_password : Local {
-    my ( $self, $c ) = @_;
+sub common_password : Local : Args(0) {
+    my ($self, $c) = @_;
 
-    $c->detach( 'redirect' ) unless $c->user;
+    my $password = $c->get_param('password_register');
 
-    # FIXME - CSRF check here
-    # FIXME - minimum criteria for passwords (length, contain number, etc)
+    my $pass = $c->forward('test_password', [ $password ]);
+    my $return = $pass ? JSON->true : $c->stash->{field_errors}->{password_register};
 
-    # If not a post then no submission
-    return unless $c->req->method eq 'POST';
+    my $body = JSON->new->utf8->allow_nonref->encode($return);
+    $c->res->content_type('application/json; charset=utf-8');
+    $c->res->body($body);
+}
 
-    # get the passwords
-    my $new     = $c->req->param('new_password') // '';
-    my $confirm = $c->req->param('confirm')      // '';
+=item test_password
 
-    # check for errors
-    my $password_error =
-       !$new && !$confirm ? 'missing'
-      : $new ne $confirm ? 'mismatch'
-      :                    '';
+Checks a password is not too weak; returns true if okay,
+false if weak (and sets stash error).
 
-    if ($password_error) {
-        $c->stash->{password_error} = $password_error;
-        $c->stash->{new_password}   = $new;
-        $c->stash->{confirm}        = $confirm;
-        return;
+=cut
+
+sub test_password : Private {
+    my ($self, $c, $password) = @_;
+
+    return 1 if $c->cobrand->call_hook('bypass_password_checks');
+
+    my $error;
+    my $min_length = $c->cobrand->password_minimum_length;
+    if (length($password) < $min_length) {
+        $error = sprintf(_('Please make sure your password is at least %d characters long'), $min_length);
+    } elsif (found($password)) {
+        $error = _('Please choose a less commonly-used password');
+    } elsif (hibp($password)) {
+        $error = _('That password has appeared in a known third-party data breach (<a href="https://haveibeenpwned.com/Passwords" target="_blank">more information</a>); please choose another');
     }
 
-    # we should have a usable password - save it to the user
-    $c->user->obj->update( { password => $new } );
-    $c->stash->{password_changed} = 1;
+    if ($error) {
+        $c->stash->{field_errors}->{password_register} = $error;
+        return 0;
+    }
+    return 1;
+}
 
+=item hibp
+
+Returns true if we should check Have I Been Pwned and the check
+comes back positive for a password that has been breached.
+
+=cut
+
+use Encode qw(encode);
+use Digest::SHA qw(sha1_hex);
+use LWP::Simple;
+use Unicode::Normalize;
+
+sub hibp : Private {
+    my $password = shift;
+
+    return 0 unless FixMyStreet->config('CHECK_HAVEIBEENPWNED');
+    my $sha1 = uc sha1_hex(encode('UTF-8', NFD($password)));
+    my $url = 'https://api.pwnedpasswords.com/range/' . substr($sha1, 0, 5);
+    my $response = LWP::Simple::get($url);
+    my $remainder = substr($sha1, 5);
+    foreach my $line (split /\r\n/, $response) {
+        my ($part, $count) = split /:/, $line;
+        return $count if $part eq $remainder;
+    }
+    return 0;
 }
 
 =head2 sign_out
@@ -249,19 +542,26 @@ Log the user out. Tell them we've done so.
 sub sign_out : Local {
     my ( $self, $c ) = @_;
     $c->logout();
+
+    if ( $c->sessionid && $c->session->{oauth} && $c->session->{oauth}{logout_redirect_uri} ) {
+        $c->response->redirect($c->session->{oauth}{logout_redirect_uri});
+        delete $c->session->{oauth}{logout_redirect_uri};
+        $c->detach;
+    }
 }
 
 sub ajax_sign_in : Path('ajax/sign_in') {
     my ( $self, $c ) = @_;
 
     my $return = {};
-    if ( $c->forward( 'sign_in' ) ) {
-        $return->{name} = $c->user->name;
+    if ( $c->forward( 'sign_in', [ $c->get_param('email') ] ) ) {
+        $return->{name} = $c->user->name || '-'; # App currently requires something returned
+        $return->{success} = 1;
     } else {
         $return->{error} = 1;
     }
 
-    my $body = JSON->new->utf8(1)->encode( $return );
+    my $body = encode_json($return);
     $c->res->content_type('application/json; charset=utf-8');
     $c->res->body($body);
 
@@ -273,7 +573,7 @@ sub ajax_sign_out : Path('ajax/sign_out') {
 
     $c->logout();
 
-    my $body = JSON->new->utf8(1)->encode( { signed_out => 1 } );
+    my $body = encode_json( { signed_out => 1 } );
     $c->res->content_type('application/json; charset=utf-8');
     $c->res->body($body);
 
@@ -291,7 +591,7 @@ sub ajax_check_auth : Path('ajax/check_auth') {
         $code = 200;
     }
 
-    my $body = JSON->new->utf8(1)->encode( $data );
+    my $body = encode_json($data);
     $c->res->content_type('application/json; charset=utf-8');
     $c->res->code($code);
     $c->res->body($body);
@@ -311,6 +611,8 @@ Mainly intended for testing but might also be useful for ajax calls.
 sub check_auth : Local {
     my ( $self, $c ) = @_;
 
+    $c->authenticate(undef, 'access_token') unless $c->user;
+
     # choose the response
     my ( $body, $code )    #
       = $c->user
@@ -325,6 +627,11 @@ sub check_auth : Local {
     # header but we ignore that here. The spec is not keeping up with usage.
 
     return;
+}
+
+sub two_factor_setup_success : Private {
+    my ($self, $c) = @_;
+    # Only here to be detached to after setup success
 }
 
 __PACKAGE__->meta->make_immutable;

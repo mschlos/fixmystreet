@@ -1,27 +1,47 @@
-#!/usr/bin/perl
-#
 # FixMyStreet:Map::Bing
-# Bing maps on FixMyStreet.
-#
-# Copyright (c) 2010 UK Citizens Online Democracy. All rights reserved.
-# Email: matthew@mysociety.org; WWW: http://www.mysociety.org/
+# Bing maps on FixMyStreet, using OpenLayers.
 
 package FixMyStreet::Map::Bing;
+use base 'FixMyStreet::Map::OSM';
 
 use strict;
 
-# display_map C PARAMS
-# PARAMS include:
-# latitude, longitude for the centre point of the map
-# CLICKABLE is set if the map is clickable
-# PINS is array of pins to show, location and colour
-sub display_map {
-    my ($self, $c, %params) = @_;
-    $c->stash->{map} = {
-        %params,
-        type => 'bing',
-        key => mySociety::Config::get('BING_MAPS_API_KEY'),
-    };
+sub map_type { '' }
+
+sub map_javascript { [
+    '/vendor/OpenLayers/OpenLayers.fixmystreet.js',
+    '/js/map-OpenLayers.js',
+    '/js/map-bing-ol.js',
+] }
+
+sub copyright { '' }
+
+sub get_quadkey {
+    my ($self, $x, $y, $z) = @_;
+    my $key = '';
+    for (my $i = $z; $i > 0; $i--) {
+        my $digit = 0;
+        my $mask = 1 << ($i - 1);
+        $digit++ if ($x & $mask) != 0;
+        $digit += 2 if ($y & $mask) != 0;
+        $key .= $digit;
+    }
+    return $key;
+}
+
+my $road_base = '//%s.ssl.ak.dynamic.tiles.virtualearth.net/comp/ch/%s?mkt=en-US&it=G,L&src=t&shading=hill&og=969&n=z';
+my $aerial_base = '//%s.ssl.ak.dynamic.tiles.virtualearth.net/comp/ch/%s?mkt=en-US&it=A,G,L&src=t&og=969&n=z';
+
+sub map_tiles {
+    my ( $self, %params ) = @_;
+    my ( $x, $y, $z ) = ( $params{x_tile}, $params{y_tile}, $params{zoom_act} );
+    my $tile_base = $params{aerial} ? $aerial_base : $road_base;
+    return [
+        sprintf($tile_base, 't0', $self->get_quadkey($x-1, $y-1, $z)),
+        sprintf($tile_base, 't1', $self->get_quadkey($x,   $y-1, $z)),
+        sprintf($tile_base, 't2', $self->get_quadkey($x-1, $y,   $z)),
+        sprintf($tile_base, 't3', $self->get_quadkey($x,   $y,   $z)),
+    ];
 }
 
 1;

@@ -1,5 +1,7 @@
-#!/usr/bin/perl -w
+#!/usr/bin/env perl
+
 use strict;
+use warnings;
 
 # Generates a version of .po file, which is a translation
 # into a language the same as English, with replacement as specified in PoChange
@@ -14,6 +16,7 @@ mkdir("en_GB.UTF-8");
 mkdir("en_GB.UTF-8/LC_MESSAGES");
 
 my $pofile = shift;
+die "Please supply a filename" unless $pofile;
 
 open(MAINPO, "FixMyStreet.po") or die "";
 open(EHAPO, ">$pofile.po") or die "";

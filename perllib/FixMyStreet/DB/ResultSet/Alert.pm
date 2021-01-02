@@ -7,19 +7,14 @@ use warnings;
 sub timeline_created {
     my ( $rs, $restriction ) = @_;
 
-    my $prefetch = 
-        FixMyStreet::App->model('DB')->schema->storage->sql_maker->quote_char ?
-        [ qw/alert_type user/ ] :
-        [ qw/alert_type/ ];
-
     return $rs->search(
         {
-            whensubscribed => { '>=', \"ms_current_timestamp()-'7 days'::interval" },
+            whensubscribed => { '>=', \"current_timestamp-'7 days'::interval" },
             confirmed => 1,
             %{ $restriction },
         },
         {
-            prefetch => $prefetch,
+            prefetch => [ qw/alert_type user/ ],
         }
     );
 }
@@ -29,10 +24,17 @@ sub timeline_disabled {
 
     return $rs->search(
         {
-            whendisabled => { '>=', \"ms_current_timestamp()-'7 days'::interval" },
+            whendisabled => { '>=', \"current_timestamp-'7 days'::interval" },
             %{ $restriction },
         },
     );
+}
+
+# Return summary for alerts on reports (so excluding alerts on updates)
+sub summary_report_alerts {
+    my ( $rs, $restriction ) = @_;
+    $rs = $rs->search({ alert_type => { '!=', 'new_updates' } });
+    return $rs->summary_count($restriction);
 }
 
 sub summary_count {
@@ -47,4 +49,5 @@ sub summary_count {
         }
     );
 }
+
 1;

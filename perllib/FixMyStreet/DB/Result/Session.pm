@@ -8,7 +8,11 @@ use strict;
 use warnings;
 
 use base 'DBIx::Class::Core';
-__PACKAGE__->load_components("FilterColumn", "InflateColumn::DateTime", "EncodedColumn");
+__PACKAGE__->load_components(
+  "FilterColumn",
+  "FixMyStreet::InflateColumn::DateTime",
+  "FixMyStreet::EncodedColumn",
+);
 __PACKAGE__->table("sessions");
 __PACKAGE__->add_columns(
   "id",
@@ -21,8 +25,27 @@ __PACKAGE__->add_columns(
 __PACKAGE__->set_primary_key("id");
 
 
-# Created by DBIx::Class::Schema::Loader v0.07017 @ 2012-03-08 17:19:55
-# DO NOT MODIFY THIS OR ANYTHING ABOVE! md5sum:MVmCn4gLQWXTDIIaDHiVmA
+# Created by DBIx::Class::Schema::Loader v0.07035 @ 2019-04-25 12:06:39
+# DO NOT MODIFY THIS OR ANYTHING ABOVE! md5sum:HoYrCwULpxJVJ1m9ASMk3A
 
-# You can replace this text with custom code or comments, and it will be preserved on regeneration
+use Storable;
+use MIME::Base64;
+
+sub id_code {
+    my $self = shift;
+    my $id = $self->id;
+    $id =~ s/^session://;
+    $id =~ s/\s+$//;
+    return $id;
+}
+
+sub user {
+    my $self = shift;
+    return unless $self->session_data;
+    my $data = Storable::thaw(MIME::Base64::decode($self->session_data));
+    return unless $data->{__user};
+    my $user = $self->result_source->schema->resultset("User")->find($data->{__user}{id});
+    return $user;
+}
+
 1;

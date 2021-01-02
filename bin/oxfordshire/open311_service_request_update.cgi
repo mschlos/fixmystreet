@@ -4,7 +4,7 @@
 # Bentley and offering them up as XML service request updates.
 # https://github.com/mysociety/fixmystreet/wiki/Open311-FMS---Proposed-differences-to-Open311
 #
-# mySociety: http://code.fixmystreet.com/
+# mySociety: http://fixmystreet.org/
 #-----------------------------------------------------------------
 
 require 'open311_services.pm';
@@ -102,7 +102,7 @@ XML
     foreach my $row(@{$ary_ref})  {
         if (defined $row) {
             my ($id, $service_req_id, $updated_at, $status, $desc) = map { prepare_for_xml($_) } @$row;
-            $updated_at=~s/(\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d)/${1}T${2}Z/; # for now assume OCC in Zulu time
+            $updated_at = get_utc_iso8601_string($updated_at); # value from the DB is in server-local time, convert to UTC.
             $xml.= <<XML;
     <request_update>
         <update_id>$id</update_id>

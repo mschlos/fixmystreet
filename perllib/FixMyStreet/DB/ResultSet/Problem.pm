@@ -4,15 +4,16 @@ use base 'DBIx::Class::ResultSet';
 use strict;
 use warnings;
 
-use CronFns;
+use Memcached;
+use mySociety::Locale;
+use FixMyStreet::DB;
 
-use Utils;
-use mySociety::Config;
-use mySociety::EmailUtil;
-use mySociety::MaPit;
-
-use FixMyStreet::App;
-use FixMyStreet::SendReport;
+use Moo;
+with 'FixMyStreet::Roles::FullTextSearch';
+__PACKAGE__->load_components('Helper::ResultSet::Me');
+sub text_search_columns { qw(id external_id bodies_str name title detail) }
+sub text_search_nulls { qw(external_id bodies_str) }
+sub text_search_translate { '/.' }
 
 my $site_key;
 
@@ -21,18 +22,86 @@ sub set_restriction {
     $site_key = $key;
 }
 
+sub body_query {
+    my ($rs, $bodies) = @_;
+    unless (ref $bodies eq 'ARRAY') {
+        $bodies = [ map { ref $_ ? $_->id : $_ } $bodies ];
+    }
+    \[ "regexp_split_to_array(bodies_str, ',') && ?", [ {} => $bodies ] ]
+}
+
+# Edits PARAMS in place to either hide non_public reports, or show them
+# if user is superuser (all) or inspector (correct body)
+sub non_public_if_possible {
+    my ($rs, $params, $c, $table) = @_;
+    $table ||= 'me';
+    if ($c->user_exists) {
+        my $only_non_public = $c->stash->{only_non_public} ? 1 : 0;
+        if ($c->user->is_superuser) {
+            # See all reports, no restriction
+            $params->{"$table.non_public"} = 1 if $only_non_public;
+        } elsif ($c->user->has_body_permission_to('report_inspect') ||
+                 $c->user->has_body_permission_to('report_mark_private')) {
+            if ($only_non_public) {
+                $params->{'-and'} = [
+                    "$table.non_public" => 1,
+                    $rs->body_query($c->user->from_body->id),
+                ];
+            } else {
+                $params->{'-or'} = [
+                    "$table.non_public" => 0,
+                    $rs->body_query($c->user->from_body->id),
+                ];
+            }
+        } else {
+            $params->{"$table.non_public"} = 0;
+        }
+    } else {
+        $params->{"$table.non_public"} = 0;
+    }
+}
+
+sub to_body {
+    my ($rs, $bodies, $join) = @_;
+    return $rs unless $bodies;
+    $join = { join => 'problem' } if $join;
+    $rs = $rs->search(
+        # This isn't using $rs->body_query because $rs might be Problem, Comment, or Nearby
+        FixMyStreet::DB::ResultSet::Problem->body_query($bodies),
+        $join
+    );
+    return $rs;
+}
+
 # Front page statistics
+
+sub _cache_timeout {
+    FixMyStreet->config('CACHE_TIMEOUT') // 3600;
+}
+
+sub recent_completed {
+    my $rs = shift;
+    $rs->_recent_in_states('completed', [
+        FixMyStreet::DB::Result::Problem->fixed_states(),
+        FixMyStreet::DB::Result::Problem->closed_states()
+    ]);
+}
 
 sub recent_fixed {
     my $rs = shift;
-    my $key = "recent_fixed:$site_key";
+    $rs->_recent_in_states('fixed', [ FixMyStreet::DB::Result::Problem->fixed_states() ]);
+}
+
+sub _recent_in_states {
+    my ($rs, $state_key, $states) = @_;
+    my $key = "recent_$state_key:$site_key";
     my $result = Memcached::get($key);
     unless ($result) {
         $result = $rs->search( {
-            state => [ FixMyStreet::DB::Result::Problem->fixed_states() ],
+            state => $states,
             lastupdate => { '>', \"current_timestamp-'1 month'::interval" },
         } )->count;
-        Memcached::set($key, $result, 3600);
+        Memcached::set($key, $result, _cache_timeout());
     }
     return $result;
 }
@@ -46,7 +115,7 @@ sub number_comments {
             { 'comments.state' => 'confirmed' },
             { join => 'comments' }
         )->count;
-        Memcached::set($key, $result, 3600);
+        Memcached::set($key, $result, _cache_timeout());
     }
     return $result;
 }
@@ -61,7 +130,7 @@ sub recent_new {
             state => [ FixMyStreet::DB::Result::Problem->visible_states() ],
             confirmed => { '>', \"current_timestamp-'$interval'::interval" },
         } )->count;
-        Memcached::set($key, $result, 3600);
+        Memcached::set($key, $result, _cache_timeout());
     }
     return $result;
 }
@@ -84,8 +153,8 @@ sub _recent {
     my $key = $photos ? 'recent_photos' : 'recent';
     $key .= ":$site_key:$num";
 
-    # unconfirmed might be returned for e.g. Zurich, but would mean in moderation, so no photo
-    my @states = grep { $_ ne 'unconfirmed' } FixMyStreet::DB::Result::Problem->visible_states();
+    # submitted might be returned for e.g. Zurich, but would mean in moderation, so no photo
+    my @states = grep { $_ ne 'submitted' } FixMyStreet::DB::Result::Problem->visible_states();
     my $query = {
         non_public => 0,
         state      => \@states,
@@ -93,37 +162,29 @@ sub _recent {
     $query->{photo} = { '!=', undef } if $photos;
 
     my $attrs = {
-        order_by => { -desc => 'coalesce(confirmed, created)' },
+        order_by => { -desc => \'coalesce(confirmed, created)' },
         rows => $num,
     };
 
     my $probs;
-    my $new = 0;
-    if (defined $lat) {
-        my $dist2 = $dist; # Create a copy of the variable to stop it being stringified into a locale in the next line!
-        $key .= ":$lat:$lon:$dist2";
-        $probs = Memcached::get($key);
-        unless ($probs) {
-            $attrs->{bind} = [ $lat, $lon, $dist ];
-            $attrs->{join} = 'nearby';
-            $probs = [ mySociety::Locale::in_gb_locale {
-                $rs->search( $query, $attrs )->all;
-            } ];
-            $new = 1;
-        }
+    if (defined $lat) { # No caching
+        $attrs->{bind} = [ $lat, $lon, $dist ];
+        $attrs->{join} = 'nearby';
+        $probs = [ mySociety::Locale::in_gb_locale {
+            $rs->search( $query, $attrs )->all;
+        } ];
     } else {
         $probs = Memcached::get($key);
-        unless ($probs) {
+        if ($probs) {
+            # Need to refetch to check if hidden since cached
+            $probs = [ $rs->search({
+                id => [ map { $_->id } @$probs ],
+                %$query,
+            }, $attrs)->all ];
+        } else {
             $probs = [ $rs->search( $query, $attrs )->all ];
-            $new = 1;
+            Memcached::set($key, $probs, _cache_timeout());
         }
-    }
-
-    if ( $new ) {
-        Memcached::set($key, $probs, 3600);
-    } else {
-        # Need to reattach schema so that confirmed column gets reinflated.
-        $probs->[0]->result_source->schema( $rs->result_source->schema ) if $probs->[0];
     }
 
     return $probs;
@@ -132,23 +193,46 @@ sub _recent {
 # Problems around a location
 
 sub around_map {
-    my ( $rs, $min_lat, $max_lat, $min_lon, $max_lon, $interval, $limit ) = @_;
+    my ( $rs, $c, %p) = @_;
     my $attr = {
-        order_by => { -desc => 'created' },
+        order_by => $p{order},
+        rows => $c->cobrand->reports_per_page,
     };
-    $attr->{rows} = $limit if $limit;
+    if ($c->user_exists) {
+        if ($c->user->from_body || $c->user->is_superuser) {
+            push @{$attr->{prefetch}}, 'contact';
+        }
+        if ($c->user->has_body_permission_to('planned_reports')) {
+            push @{$attr->{prefetch}}, 'user_planned_reports';
+        }
+        if ($c->user->has_body_permission_to('report_edit_priority') || $c->user->has_body_permission_to('report_inspect')) {
+            push @{$attr->{prefetch}}, 'response_priority';
+        }
+    }
+
+    unless ( $p{states} ) {
+        $p{states} = FixMyStreet::DB::Result::Problem->visible_states();
+    }
 
     my $q = {
-            non_public => 0,
-            state => [ FixMyStreet::DB::Result::Problem->visible_states() ],
-            latitude => { '>=', $min_lat, '<', $max_lat },
-            longitude => { '>=', $min_lon, '<', $max_lon },
+            'me.state' => [ keys %{$p{states}} ],
+            latitude => { '>=', $p{min_lat}, '<', $p{max_lat} },
+            longitude => { '>=', $p{min_lon}, '<', $p{max_lon} },
     };
-    $q->{'current_timestamp - lastupdate'} = { '<', \"'$interval'::interval" }
-        if $interval;
 
-    my @problems = mySociety::Locale::in_gb_locale { $rs->search( $q, $attr )->all };
-    return \@problems;
+    $q->{$c->stash->{report_age_field}} = { '>=', \"current_timestamp-'$p{report_age}'::interval" } if
+        $p{report_age};
+    $q->{'me.category'} = $p{categories} if $p{categories} && @{$p{categories}};
+
+    $rs->non_public_if_possible($q, $c);
+
+    # Add in any optional extra query parameters
+    $q = { %$q, %{$p{extra}} } if $p{extra};
+
+    my $problems = mySociety::Locale::in_gb_locale {
+        $rs->search( $q, $attr )->include_comment_counts->page($p{page});
+    };
+    return $problems;
 }
 
 # Admin functions
@@ -156,21 +240,16 @@ sub around_map {
 sub timeline {
     my ( $rs ) = @_;
 
-    my $prefetch = 
-        FixMyStreet::App->model('DB')->schema->storage->sql_maker->quote_char ?
-        [ qw/user/ ] :
-        [];
-
     return $rs->search(
         {
             -or => {
-                created  => { '>=', \"ms_current_timestamp()-'7 days'::interval" },
-                confirmed => { '>=', \"ms_current_timestamp()-'7 days'::interval" },
-                whensent  => { '>=', \"ms_current_timestamp()-'7 days'::interval" },
+                'me.created' => { '>=', \"current_timestamp-'7 days'::interval" },
+                'me.confirmed' => { '>=', \"current_timestamp-'7 days'::interval" },
+                'me.whensent' => { '>=', \"current_timestamp-'7 days'::interval" },
             }
         },
         {
-            prefetch => $prefetch,
+            prefetch => 'user',
         }
     );
 }
@@ -194,9 +273,9 @@ sub unique_users {
     return $rs->search( {
         state => [ FixMyStreet::DB::Result::Problem->visible_states() ],
     }, {
-        select => [ { count => { distinct => 'user_id' } } ],
-        as     => [ 'count' ]
-    } )->first->get_column('count');
+        columns => [ 'user_id' ],
+        distinct => 1,
+    } );
 }
 
 sub categories_summary {
@@ -216,269 +295,18 @@ sub categories_summary {
     return \%categories;
 }
 
-sub send_reports {
-    my ( $rs, $site_override ) = @_;
-
-    # Set up site, language etc.
-    my ($verbose, $nomail) = CronFns::options();
-    my $base_url = mySociety::Config::get('BASE_URL');
-    my $site = $site_override || CronFns::site($base_url);
-
-    my $states = [ 'confirmed', 'fixed' ];
-    $states = [ 'unconfirmed', 'confirmed', 'in progress', 'planned', 'closed' ] if $site eq 'zurich';
-    my $unsent = FixMyStreet::App->model("DB::Problem")->search( {
-        state => $states,
-        whensent => undef,
-        bodies_str => { '!=', undef },
-    } );
-    my (%notgot, %note);
-
-    my $send_report = FixMyStreet::SendReport->new();
-    my $senders = $send_report->get_senders;
-    my %sending_skipped_by_method;
-
-    while (my $row = $unsent->next) {
-
-        my $cobrand = FixMyStreet::Cobrand->get_class_for_moniker($row->cobrand)->new();
-
-        # Cobranded and non-cobranded messages can share a database. In this case, the conf file 
-        # should specify a vhost to send the reports for each cobrand, so that they don't get sent 
-        # more than once if there are multiple vhosts running off the same database. The email_host
-        # call checks if this is the host that sends mail for this cobrand.
-        next unless $cobrand->email_host();
-        $cobrand->set_lang_and_domain($row->lang, 1);
-        if ( $row->is_from_abuser ) {
-            $row->update( { state => 'hidden' } );
-            next;
-        }
-
-        # Template variables for the email
-        my $email_base_url = $cobrand->base_url_for_report($row);
-        my %h = map { $_ => $row->$_ } qw/id title detail name category latitude longitude used_map/;
-        map { $h{$_} = $row->user->$_ } qw/email phone/;
-        $h{confirmed} = DateTime::Format::Pg->format_datetime( $row->confirmed->truncate (to => 'second' ) )
-            if $row->confirmed;
-
-        $h{query} = $row->postcode;
-        $h{url} = $email_base_url . $row->url;
-        $h{admin_url} = $cobrand->admin_base_url . 'report_edit/' . $row->id;
-        $h{phone_line} = $h{phone} ? _('Phone:') . " $h{phone}\n\n" : '';
-        if ($row->photo) {
-            $h{has_photo} = _("This web page also contains a photo of the problem, provided by the user.") . "\n\n";
-            $h{image_url} = $email_base_url . '/photo/' . $row->id . '.full.jpeg';
-        } else {
-            $h{has_photo} = '';
-            $h{image_url} = '';
-        }
-        $h{fuzzy} = $row->used_map ? _('To view a map of the precise location of this issue')
-            : _('The user could not locate the problem on a map, but to see the area around the location they entered');
-        $h{closest_address} = '';
-
-        # If we are in the UK include eastings and northings, and nearest stuff
-        $h{easting_northing} = '';
-        if ( $cobrand->country eq 'GB' ) {
-
-            ( $h{easting}, $h{northing} ) = Utils::convert_latlon_to_en( $h{latitude}, $h{longitude} );
-
-            # email templates don't have conditionals so we need to farmat this here
-            $h{easting_northing}                             #
-              = "Easting: $h{easting}\n\n"                   #
-              . "Northing: $h{northing}\n\n";
-
-        }
-
-        if ( $row->used_map ) {
-            $h{closest_address} = $cobrand->find_closest( $h{latitude}, $h{longitude}, $row );
-        }
-
-        if ( $cobrand->allow_anonymous_reports &&
-             $row->user->email eq $cobrand->anonymous_account->{'email'}
-         ) {
-             $h{anonymous_report} = 1;
-             $h{user_details} = _('This report was submitted anonymously');
-         } else {
-             $h{user_details} = sprintf(_('Name: %s'), $row->name) . "\n\n";
-             $h{user_details} .= sprintf(_('Email: %s'), $row->user->email) . "\n\n";
-         }
-
-        my %reporters = ();
-        my ( $sender_count );
-        if ($site eq 'emptyhomes') {
-
-            my $body = $row->bodies_str;
-            $body = FixMyStreet::App->model("DB::Body")->find($body);
-            my $sender = "FixMyStreet::SendReport::EmptyHomes";
-            $reporters{ $sender } = $sender->new() unless $reporters{$sender};
-            $reporters{ $sender }->add_body( $body );
-
-        } else {
-
-            # XXX Needs locks!
-            # XXX Only copes with at most one missing body
-            my ($bodies, $missing) = $row->bodies_str =~ /^([\d,]+)(?:\|(\d+))?/;
-            my @bodies = split(/,/, $bodies);
-            $bodies = FixMyStreet::App->model("DB::Body")->search({ id => \@bodies });
-            $missing = FixMyStreet::App->model("DB::Body")->find($missing) if $missing;
-            my @dear;
-
-            while (my $body = $bodies->next) {
-                my $sender_info = $cobrand->get_body_sender( $body, $row->category );
-                my $sender = "FixMyStreet::SendReport::" . $sender_info->{method};
-
-                if ( ! exists $senders->{ $sender } ) {
-                    warn "No such sender [ $sender ] for body $body->name ( $body->id )";
-                    next;
-                }
-                $reporters{ $sender } ||= $sender->new();
-
-                if ( $reporters{ $sender }->should_skip( $row ) ) {
-                    $sending_skipped_by_method{ $sender }++ if 
-                        $reporters{ $sender }->skipped;
-                } else {
-                    push @dear, $body->name;
-                    $reporters{ $sender }->add_body( $body, $sender_info->{config} );
-                }
-            }
-
-            if ($h{category} eq _('Other')) {
-                $h{category_footer} = _('this type of local problem');
-                $h{category_line} = '';
-            } else {
-                $h{category_footer} = "'" . $h{category} . "'";
-                $h{category_line} = sprintf(_("Category: %s"), $h{category}) . "\n\n";
-            }
-
-            if ( $row->subcategory ) {
-                $h{subcategory_line} = sprintf(_("Subcategory: %s"), $row->subcategory) . "\n\n";
-            }
-
-            $h{bodies_name} = join(_(' and '), @dear);
-            if ($h{category} eq _('Other')) {
-                $h{multiple} = @dear>1 ? "[ " . _("This email has been sent to both councils covering the location of the problem, as the user did not categorise it; please ignore it if you're not the correct council to deal with the issue, or let us know what category of problem this is so we can add it to our system.") . " ]\n\n"
-                    : '';
-            } else {
-                $h{multiple} = @dear>1 ? "[ " . _("This email has been sent to several councils covering the location of the problem, as the category selected is provided for all of them; please ignore it if you're not the correct council to deal with the issue.") . " ]\n\n"
-                    : '';
-            }
-            $h{missing} = ''; 
-            if ($missing) {
-                $h{missing} = '[ '
-                  . sprintf(_('We realise this problem might be the responsibility of %s; however, we don\'t currently have any contact details for them. If you know of an appropriate contact address, please do get in touch.'), $missing->name)
-                  . " ]\n\n";
-            }
-
-            $sender_count = scalar @dear;
-        }
-
-        unless ( keys %reporters ) {
-            die 'Report not going anywhere for ID ' . $row->id . '!';
-        }
-
-        next unless $sender_count;
-
-        if (mySociety::Config::get('STAGING_SITE') && !mySociety::Config::get('SEND_REPORTS_ON_STAGING')) {
-            # on a staging server send emails to ourselves rather than the bodies
-            %reporters = map { $_ => $reporters{$_} } grep { /FixMyStreet::SendReport::(Email|NI)/ } keys %reporters;
-            unless (%reporters) {
-                %reporters = ( 'FixMyStreet::SendReport::Email' => FixMyStreet::SendReport::Email->new() );
-            }
-        }
-
-        # Multiply results together, so one success counts as a success.
-        my $result = -1;
-
-        for my $sender ( keys %reporters ) {
-            $result *= $reporters{ $sender }->send( $row, \%h );
-            if ( $reporters{ $sender }->unconfirmed_counts) {
-                foreach my $e (keys %{ $reporters{ $sender }->unconfirmed_counts } ) {
-                    foreach my $c (keys %{ $reporters{ $sender }->unconfirmed_counts->{$e} }) {
-                        $notgot{$e}{$c} += $reporters{ $sender }->unconfirmed_counts->{$e}{$c};
-                    }
-                }
-                %note = (
-                    %note,
-                    %{ $reporters{ $sender }->unconfirmed_notes }
-                );
-            }
-        }
-
-        if ($result == mySociety::EmailUtil::EMAIL_SUCCESS) {
-            $row->update( {
-                whensent => \'ms_current_timestamp()',
-                lastupdate => \'ms_current_timestamp()',
-            } );
-            if ( $cobrand->report_sent_confirmation_email && !$h{anonymous_report}) {
-                _send_report_sent_email( $row, \%h, $nomail );
-            }
-        } else {
-            my @errors;
-            for my $sender ( keys %reporters ) {
-                unless ( $reporters{ $sender }->success ) {
-                    push @errors, $reporters{ $sender }->error;
-                }
-            }
-            $row->update_send_failed( join( '|', @errors ) );
-        }
-    }
-
-    if ($verbose) {
-        print "Council email addresses that need checking:\n" if keys %notgot;
-        foreach my $e (keys %notgot) {
-            foreach my $c (keys %{$notgot{$e}}) {
-                print "    " . $notgot{$e}{$c} . " problem, to $e category $c (" . $note{$e}{$c}. ")\n";
-            }
-        }
-        if (keys %sending_skipped_by_method) {
-            my $c = 0;
-            print "\nProblem reports that send-reports did not attempt to send the following:\n";
-            foreach my $send_method (sort keys %sending_skipped_by_method) {
-                printf "    %-24s %4d\n", "$send_method:", $sending_skipped_by_method{$send_method};
-                $c+=$sending_skipped_by_method{$send_method};
-            }
-            printf "    %-24s %4d\n", "Total:", $c;
-        }
-        my $sending_errors = '';
-        my $unsent = FixMyStreet::App->model("DB::Problem")->search( {
-            state => [ 'confirmed', 'fixed' ],
-            whensent => undef,
-            bodies_str => { '!=', undef },
-            send_fail_count => { '>', 0 }
-        } );
-        while (my $row = $unsent->next) {
-            $sending_errors .= "* http://www.fixmystreet.com/report/" . $row->id . ", failed "
-                . $row->send_fail_count . " times, last at " . $row->send_fail_timestamp
-                . ", reason " . $row->send_fail_reason . "\n";
-        }
-        if ($sending_errors) {
-            print "The following reports had problems sending:\n$sending_errors";
-        }
-    }
-}
-
-sub _send_report_sent_email {
-    my $row = shift;
-    my $h = shift;
-    my $nomail = shift;
-
-    my $template = 'confirm_report_sent.txt';
-    my $template_path = FixMyStreet->path_to( "templates", "email", $row->cobrand, $row->lang, $template )->stringify;
-    $template_path = FixMyStreet->path_to( "templates", "email", $row->cobrand, $template )->stringify
-        unless -e $template_path;
-    $template_path = FixMyStreet->path_to( "templates", "email", "default", $template )->stringify
-        unless -e $template_path;
-    $template = Utils::read_file( $template_path );
-
-    my $result = FixMyStreet::App->send_email_cron(
-        {
-            _template_ => $template,
-            _parameters_ => $h,
-            To => $row->user->email,
-            From => mySociety::Config::get('CONTACT_EMAIL'),
-        },
-        mySociety::Config::get('CONTACT_EMAIL'),
-        [ $row->user->email ],
-        $nomail
-    );
+sub include_comment_counts {
+    my $rs = shift;
+    my $order_by = $rs->{attrs}{order_by};
+    return $rs unless
+        (ref $order_by eq 'ARRAY' && ref $order_by->[0] eq 'HASH' && $order_by->[0]->{-desc} eq 'comment_count')
+        || (ref $order_by eq 'HASH' && $order_by->{-desc} eq 'comment_count');
+    $rs->search({}, {
+        '+select' => [ {
+            "" => \'(select count(*) from comment where problem_id=me.id and state=\'confirmed\')',
+            -as => 'comment_count'
+        } ]
+    });
 }
 
 1;

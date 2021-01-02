@@ -1,7 +1,3 @@
-use strict;
-use warnings;
-use Test::More;
-
 use FixMyStreet::TestMech;
 my $mech = FixMyStreet::TestMech->new;
 
@@ -12,8 +8,11 @@ subtest "check that the form goes to /around" => sub {
     $mech->get_ok('/');
     is $mech->uri->path, '/', "still on '/'";
 
-    # submit form
-    $mech->submit_form_ok( { with_fields => { pc => 'SW1A 1AA', } } );
+    FixMyStreet::override_config {
+        MAPIT_URL => 'http://mapit.uk/'
+    }, sub {
+        $mech->submit_form_ok( { with_fields => { pc => 'SW1A 1AA', } } );
+    };
 
     # check that we are at /around
     is $mech->uri->path, '/around', "Got to /around";
@@ -30,15 +29,15 @@ subtest "does pc, (x,y), (e,n) or (lat,lon) go to /around" => sub {
         },
         {
             in  => { lat => 51.50100, lon => -0.14158 },
-            out => { lat => 51.50100, lon => -0.14158, zoom => 3 },
+            out => { lat => 51.50100, lon => -0.14158 },
         },
         {
             in  => { x   => 3281,      y   => 1113, },
-            out => { lat => 51.499825, lon => -0.140137, zoom => 3 },
+            out => { lat => 51.499825, lon => -0.140137 },
         },
         {
             in  => { e   => 1234,      n   => 4567 },
-            out => { lat => 49.808509, lon => -7.544784, zoom => 3 },
+            out => { lat => 49.808509, lon => -7.544784 },
         },
       )
     {
@@ -47,7 +46,11 @@ subtest "does pc, (x,y), (e,n) or (lat,lon) go to /around" => sub {
         $uri->query_form( $test->{in} );
 
         # get the uri and check for 302
-        $mech->get_ok($uri);
+        FixMyStreet::override_config {
+            MAPIT_URL => 'http://mapit.uk/',
+        }, sub {
+            $mech->get_ok($uri);
+        };
 
         # check that we are at /around
         is $mech->uri->path, '/around', "Got to /around";
@@ -55,9 +58,7 @@ subtest "does pc, (x,y), (e,n) or (lat,lon) go to /around" => sub {
     }
 };
 
-$mech->delete_problems_for_body( 2651 );
-
-my $problem_rs = FixMyStreet::App->model('DB::Problem');
+my $problem_rs = FixMyStreet::DB->resultset('Problem');
 my $num = $problem_rs->count;
 
 my @edinburgh_problems = $mech->create_problems_for_body(5, 2651, 'Front page');
@@ -74,4 +75,29 @@ ok $mech->get('/report/' . $edinburgh_problems[2]->id);
 is $mech->res->code, 403, 'page forbidden';
 is $problem_rs->count, $num+5;
 
-done_testing();
+my $oxon = $mech->create_body_ok(2237, 'Oxfordshire County Council');
+subtest "prefilters /around if user has categories" => sub {
+    my $user = $mech->log_in_ok('test@example.com');
+    my $categories = [
+        $mech->create_contact_ok( body_id => $oxon->id, category => 'Cows', email => 'cows@example.net' )->id,
+        $mech->create_contact_ok( body_id => $oxon->id, category => 'Potholes', email => 'potholes@example.net' )->id,
+    ];
+    $user->from_body($oxon);
+    $user->set_extra_metadata('categories', $categories);
+    $user->update;
+
+    $mech->get_ok('/');
+    # NB can't use visible_form_values because categories field is hidden
+    $mech->content_contains("Cows,Potholes");
+};
+
+subtest "prefilters /around if filter_category given in URL" => sub {
+    $mech->get_ok('/?filter_category=MyUniqueTestCategory&filter_group=MyUniqueTestGroup');
+    # NB can't use visible_form_values because fields are hidden
+    $mech->content_contains("MyUniqueTestCategory");
+    $mech->content_contains("MyUniqueTestGroup");
+};
+
+END {
+    done_testing();
+}

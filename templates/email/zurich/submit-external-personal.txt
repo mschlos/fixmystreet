@@ -1,13 +1,17 @@
-Subject: FixMyZurich: Neue Meldung #<?=$values['id']?>
+Subject: Züri wie neu: Weitergeleitete Meldung #[% report.id %]
 
-Guten Tag <?=$values['bodies_name']?>,
+Grüezi [% bodies_name %],
 
-Diese Meldung wurde Ihnen von der Stadt Zürich gesendet, da es Ihr Zuständigkeitsgebiet betreffen könnte.
+[% external_message %]
 
-Öffentliche URL: <?=$values['url']?>
 
-Reporter name: <?=$values['name']?>
+Öffentliche URL: [% url %]
 
-Reporter email: <?=$values['email']?>
+Name des Meldenden: [% report.name %]
 
-Reporter phone: <?=$values['phone']?>
+Email des Meldenden: [% report.user.email %]
+
+Telefonnummer des Meldenden: [% report.user.phone %]
+
+
+Bei Fragen zu "Züri wie neu" wenden Sie sich bitte an gis-zentrum@zuerich.ch.

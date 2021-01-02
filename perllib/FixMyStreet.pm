@@ -6,13 +6,16 @@ use warnings;
 use Path::Class;
 my $ROOT_DIR = file(__FILE__)->parent->parent->absolute->resolve;
 
+use DateTime::TimeZone;
 use Readonly;
+use Sub::Override;
 
 use mySociety::Config;
-use mySociety::DBHandle;
+
+my $CONF_FILE = $ENV{FMS_OVERRIDE_CONFIG} || 'general.yml';
 
 # load the config file and store the contents in a readonly hash
-mySociety::Config::set_file( __PACKAGE__->path_to("conf/general") );
+mySociety::Config::set_file( __PACKAGE__->path_to("conf/${CONF_FILE}") );
 Readonly::Hash my %CONFIG, %{ mySociety::Config::get_list() };
 
 =head1 NAME
@@ -47,6 +50,9 @@ my $TEST_MODE = undef;
 sub test_mode {
     my $class = shift;
     $TEST_MODE = shift if scalar @_;
+    # Make sure we don't run on live config
+    # uncoverable branch true
+    die "Do not run tests except through run-tests\n" if $TEST_MODE && $CONF_FILE eq 'general.yml';
     return $TEST_MODE;
 }
 
@@ -85,9 +91,44 @@ sub config {
     return exists $CONFIG{$key} ? $CONFIG{$key} : undef;
 }
 
+sub override_config($&) {
+    my $config = shift;
+    my $code = \&{shift @_};
+
+    mySociety::MaPit::configure($config->{MAPIT_URL}) if $config->{MAPIT_URL};
+
+    use Readonly;
+    Readonly my %ro_config => %$config;
+
+    # NB: though we have this, templates tend to use [% c.config %].
+    # This overriding happens after $c->config is set, so note that
+    # FixMyStreet::App->setup_request rewrites $c->config if we are in
+    # test_mode, so tests should Just Work there too.
+
+    my $override_guard = Sub::Override->new(
+        "FixMyStreet::config",
+        sub {
+            my ($class, $key) = @_;
+            return { %CONFIG, %ro_config } unless $key;
+            return $ro_config{$key} if exists $ro_config{$key};
+            return $CONFIG{$key} if exists $CONFIG{$key};
+        }
+    );
+
+    FixMyStreet::Map::reload_allowed_maps() if $config->{MAP_TYPE};
+    $FixMyStreet::PhotoStorage::instance = undef if $config->{PHOTO_STORAGE_BACKEND};
+
+    $code->();
+
+    $override_guard->restore();
+    mySociety::MaPit::configure() if $config->{MAPIT_URL};
+    FixMyStreet::Map::reload_allowed_maps() if $config->{MAP_TYPE};
+    $FixMyStreet::PhotoStorage::instance = undef if $config->{PHOTO_STORAGE_BACKEND};
+}
+
 =head2 dbic_connect_info
 
-    $connect_info = FixMyStreet->dbic_connect_info();
+    $connect_info = FixMyStreet->dbic_connect_info;
 
 Returns the array that DBIx::Class::Schema needs to connect to the database.
 Most of the values are read from the config file and others are hordcoded here.
@@ -99,9 +140,6 @@ Most of the values are read from the config file and others are hordcoded here.
 # http://search.cpan.org/dist/DBIx-Class/lib/DBIx/Class/Storage/DBI.pm#connect_info
 #
 # we use the one that is most similar to DBI's connect.
-
-# FIXME - should we just use mySociety::DBHandle? will that lead to AutoCommit
-# woes (we want it on, it sets it to off)?
 
 sub dbic_connect_info {
     my $class  = shift;
@@ -119,40 +157,54 @@ sub dbic_connect_info {
 
     my $dbi_args = {
         AutoCommit     => 1,
-        pg_enable_utf8 => 1,
+        AutoInactiveDestroy => 1,
     };
-    my $dbic_args = {};
+    my $local_time_zone = local_time_zone();
+    my $dbic_args = {
+        quote_names => 1,
+        on_connect_do => [
+            "SET TIME ZONE '" . $local_time_zone->name . "'",
+        ],
+    };
 
-    return [ $dsn, $user, $password, $dbi_args, $dbic_args ];
+    return ( $dsn, $user, $password, $dbi_args, $dbic_args );
 }
 
-=head2 configure_mysociety_dbhandle
+my $tz;
+my $tz_f;
 
-    FixMyStreet->configure_mysociety_dbhandle();
+sub local_time_zone {
+    $tz //= DateTime::TimeZone->new( name => "local" );
+    return $tz;
+}
 
-Calls configure in mySociety::DBHandle with args from the config. We need to do
-this so that old code that uses mySociety::DBHandle finds it properly set up. We
-can't (might not) be able to share the handle as DBIx::Class wants it with
-AutoCommit on (so that its transaction code can be used in preference to calling
-begin and commit manually) and mySociety::* code does not.
+sub time_zone {
+    $tz_f //= DateTime::TimeZone->new( name => FixMyStreet->config('TIME_ZONE') )
+        if FixMyStreet->config('TIME_ZONE');
+    return $tz_f;
+}
 
-This should be fixed/standardized to avoid having two database handles floating
-around.
+sub set_time_zone {
+    my ($class, $dt)  = @_;
+    my $tz = local_time_zone();
+    my $tz_f = time_zone();
+    $dt->set_time_zone($tz);
+    $dt->set_time_zone($tz_f) if $tz_f;
+    return $dt;
+}
 
-=cut
+# Development functions
 
-sub configure_mysociety_dbhandle {
-    my $class  = shift;
-    my $config = $class->config;
-
-    mySociety::DBHandle::configure(
-        Name     => $config->{FMS_DB_NAME},
-        User     => $config->{FMS_DB_USER},
-        Password => $config->{FMS_DB_PASS},
-        Host     => $config->{FMS_DB_HOST} || undef,
-        Port     => $config->{FMS_DB_PORT} || undef,
-    );
-
+sub staging_flag {
+    my ($cls, $flag, $value) = @_;
+    $value = 1 unless defined $value;
+    return unless $cls->config('STAGING_SITE');
+    my $flags = $cls->config('STAGING_FLAGS');
+    unless ($flags && ref $flags eq 'HASH') {
+        # Assume all flags 0 if missing
+        return !$value;
+    }
+    return $flags->{$flag} == $value;
 }
 
 1;

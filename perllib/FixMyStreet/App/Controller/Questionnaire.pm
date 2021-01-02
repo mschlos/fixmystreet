@@ -27,18 +27,18 @@ finds out if this user has answered the "ever reported" question before.
 =cut
 
 sub check_questionnaire : Private {
-    my ( $self, $c ) = @_;
+    my ( $self, $c, $unanswered ) = @_;
 
     my $questionnaire = $c->stash->{questionnaire};
 
     my $problem = $questionnaire->problem;
 
-    if ( $questionnaire->whenanswered ) {
+    my $cutoff = DateTime->now()->subtract( minutes => 2 );
+    if ( $unanswered && $questionnaire->whenanswered && $questionnaire->whenanswered < $cutoff) {
         my $problem_url = $c->cobrand->base_url_for_report( $problem ) . $problem->url;
         my $contact_url = $c->uri_for( "/contact" );
-        $c->stash->{message} = sprintf(_("You have already answered this questionnaire. If you have a question, please <a href='%s'>get in touch</a>, or <a href='%s'>view your problem</a>.\n"), $contact_url, $problem_url);
-        $c->stash->{template} = 'errors/generic.html';
-        $c->detach;
+        my $message = sprintf(_("You have already answered this questionnaire. If you have a question, please <a href='%s'>get in touch</a>, or <a href='%s'>view your problem</a>.\n"), $contact_url, $problem_url);
+        $c->detach('/page_error_400_bad_request', [ $message ]);
     }
 
     unless ( $problem->is_visible ) {
@@ -47,14 +47,11 @@ sub check_questionnaire : Private {
 
     $c->stash->{problem} = $problem;
     $c->stash->{answered_ever_reported} = $problem->user->answered_ever_reported;
+    $c->stash->{been_fixed} = $c->get_param('been_fixed') || '';
 
-    # EHA needs to know how many to alter display, and whether to send another or not
-    if ($c->cobrand->moniker eq 'emptyhomes') {
-        $c->stash->{num_questionnaire} = $c->model('DB::Questionnaire')->count(
-            { problem_id => $problem->id }
-        );
-    }
-
+    # In case they've already visited the questionnaire page, so take what was stored then
+    my $old_state = $c->stash->{old_state} = $questionnaire->old_state || $problem->state;
+    $c->stash->{was_fixed} = FixMyStreet::DB::Result::Problem->fixed_states()->{$old_state};
 }
 
 =head2 submit
@@ -67,9 +64,9 @@ token), or the mini own-report one (when we'll have a problem ID).
 sub submit : Path('submit') {
     my ( $self, $c ) = @_;
 
-    if ( $c->req->params->{token} ) {
+    if (my $token = $c->get_param('token')) {
         $c->forward('submit_standard');
-    } elsif ( $c->req->params->{problem} ) {
+    } elsif (my $p = $c->get_param('problem')) {
         $c->forward('submit_creator_fixed');
     } else {
         $c->detach( '/page_error_404_not_found' );
@@ -87,8 +84,8 @@ Display couldn't locate problem error message
 sub missing_problem : Private {
     my ( $self, $c ) = @_;
 
-    $c->stash->{message} = _("I'm afraid we couldn't locate your problem in the database.\n");
-    $c->stash->{template} = 'errors/generic.html';
+    my $message = _("I'm afraid we couldn't locate your problem in the database.\n");
+    $c->detach('/page_error_400_bad_request', [ $message ]);
 }
 
 sub submit_creator_fixed : Private {
@@ -96,8 +93,8 @@ sub submit_creator_fixed : Private {
 
     my @errors;
 
-    $c->stash->{reported} = $c->req->params->{reported};
-    $c->stash->{problem_id} = $c->req->params->{problem};
+    $c->stash->{reported} = $c->get_param('reported');
+    $c->stash->{problem_id} = $c->get_param('problem');
 
     # should only be able to get to here if we are logged and we have a
     # problem
@@ -106,6 +103,7 @@ sub submit_creator_fixed : Private {
     }
 
     my $problem = $c->cobrand->problems->find( { id => $c->stash->{problem_id} } );
+    $c->stash->{problem} = $problem;
 
     # you should not be able to answer questionnaires about problems
     # that you've not submitted
@@ -134,8 +132,8 @@ sub submit_creator_fixed : Private {
 
         $questionnaire->ever_reported( $c->stash->{reported} eq 'Yes' ? 1 : 0 );
         $questionnaire->old_state( $old_state );
-        $questionnaire->whensent( \'ms_current_timestamp()' );
-        $questionnaire->whenanswered( \'ms_current_timestamp()' );
+        $questionnaire->whensent( \'current_timestamp' );
+        $questionnaire->whenanswered( \'current_timestamp' );
         $questionnaire->insert;
     }
 
@@ -145,34 +143,50 @@ sub submit_creator_fixed : Private {
     return 1;
 }
 
-sub submit_standard : Private {
+sub record_state_change : Private {
     my ( $self, $c ) = @_;
 
-    $c->forward( '/tokens/load_questionnaire', [ $c->req->params->{token} ] );
-    $c->forward( 'check_questionnaire' );
-    $c->forward( 'process_questionnaire' );
+    return unless $c->stash->{been_fixed};
 
     my $problem = $c->stash->{problem};
-    my $old_state = $problem->state;
+    my $old_state = $c->stash->{old_state};
     my $new_state = '';
-    $new_state = 'fixed - user' if $c->stash->{been_fixed} eq 'Yes' && 
+    $new_state = 'fixed - user' if $c->stash->{been_fixed} eq 'Yes' &&
         FixMyStreet::DB::Result::Problem->open_states()->{$old_state};
     $new_state = 'fixed - user' if $c->stash->{been_fixed} eq 'Yes' &&
         FixMyStreet::DB::Result::Problem->closed_states()->{$old_state};
     $new_state = 'confirmed' if $c->stash->{been_fixed} eq 'No' &&
         FixMyStreet::DB::Result::Problem->fixed_states()->{$old_state};
+    $c->stash->{new_state} = $new_state;
 
     # Record state change, if there was one
     if ( $new_state ) {
         $problem->state( $new_state );
-        $problem->lastupdate( \'ms_current_timestamp()' );
+        $problem->lastupdate( \'current_timestamp' );
+    } elsif ($problem->state ne $old_state) {
+        $problem->state( $old_state );
+        $problem->lastupdate( \'current_timestamp' );
+    } elsif ( $c->stash->{been_fixed} eq 'No' &&
+        FixMyStreet::DB::Result::Problem->open_states->{$old_state} ) {
+        # If it's not fixed and they say it's still not been fixed, record time update
+        $problem->lastupdate( \'current_timestamp' );
     }
 
-    # If it's not fixed and they say it's still not been fixed, record time update
-    if ( $c->stash->{been_fixed} eq 'No' &&
-        FixMyStreet::DB::Result::Problem->open_states->{$old_state} ) {
-        $problem->lastupdate( \'ms_current_timestamp()' );
-    }
+    $problem->update;
+    $c->stash->{questionnaire}->update({
+        whenanswered => \'current_timestamp',
+        old_state => $old_state,
+        new_state => $c->stash->{been_fixed} eq 'Unknown' ? 'unknown' : ($new_state || $old_state),
+    });
+}
+
+sub submit_standard : Private {
+    my ( $self, $c ) = @_;
+
+    $c->forward( '/tokens/load_questionnaire', [ $c->get_param('token') ] );
+    $c->forward( 'check_questionnaire' );
+    $c->forward( 'process_questionnaire' );
+    $c->forward( 'record_state_change' );
 
     # Record questionnaire response
     my $reported = undef;
@@ -181,31 +195,27 @@ sub submit_standard : Private {
 
     my $q = $c->stash->{questionnaire};
     $q->update( {
-        whenanswered  => \'ms_current_timestamp()',
         ever_reported => $reported,
-        old_state     => $old_state,
-        new_state     => $c->stash->{been_fixed} eq 'Unknown' ? 'unknown' : ($new_state || $old_state),
     } );
 
+    my $problem = $c->stash->{problem};
+
     # Record an update if they've given one, or if there's a state change
-    if ( $new_state || $c->stash->{update} ) {
+    if ( $c->stash->{new_state} || $c->stash->{update} ) {
         my $update = $c->stash->{update} || _('Questionnaire filled in by problem reporter');
         $update = $c->model('DB::Comment')->new(
             {
                 problem      => $problem,
-                name         => $problem->name,
                 user         => $problem->user,
                 text         => $update,
-                state        => 'confirmed',
-                mark_fixed   => $new_state eq 'fixed - user' ? 1 : 0,
-                mark_open    => $new_state eq 'confirmed' ? 1 : 0,
+                mark_fixed   => $c->stash->{new_state} eq 'fixed - user' ? 1 : 0,
+                mark_open    => $c->stash->{new_state} eq 'confirmed' ? 1 : 0,
                 lang         => $c->stash->{lang_code},
                 cobrand      => $c->cobrand->moniker,
-                cobrand_data => '',
-                confirmed    => \'ms_current_timestamp()',
                 anonymous    => $problem->anonymous,
             }
         );
+        $update->set_extra_metadata( questionnaire_id => $q->id );
         if ( my $fileid = $c->stash->{upload_fileid} ) {
             $update->photo( $fileid );
         }
@@ -217,19 +227,15 @@ sub submit_standard : Private {
         if ($c->stash->{been_fixed} eq 'No' || $c->stash->{been_fixed} eq 'Unknown') && $c->stash->{another} eq 'Yes';
     $problem->update;
 
-    $c->stash->{new_state} = $new_state;
     $c->stash->{template} = 'questionnaire/completed.html';
 }
 
 sub process_questionnaire : Private {
     my ( $self, $c ) = @_;
 
-    map { $c->stash->{$_} = $c->req->params->{$_} || '' } qw(been_fixed reported another update);
+    map { $c->stash->{$_} = $c->get_param($_) || '' } qw(reported another update);
 
-    # EHA questionnaires done for you
-    if ($c->cobrand->moniker eq 'emptyhomes') {
-        $c->stash->{another} = $c->stash->{num_questionnaire}==1 ? 'Yes' : 'No';
-    }
+    $c->stash->{update} = Utils::cleanup_text($c->stash->{update}, { allow_multiline => 1 });
 
     my @errors;
     push @errors, _('Please state whether or not the problem has been fixed')
@@ -244,7 +250,7 @@ sub process_questionnaire : Private {
         if ($c->stash->{been_fixed} eq 'No' || $c->stash->{been_fixed} eq 'Unknown') && !$c->stash->{another};
 
     push @errors, _('Please provide some explanation as to why you\'re reopening this report')
-        if $c->stash->{been_fixed} eq 'No' && $c->stash->{problem}->is_fixed() && !$c->stash->{update};
+        if $c->stash->{been_fixed} eq 'No' && $c->stash->{was_fixed} && !$c->stash->{update};
 
     $c->forward('/photo/process_photo');
     push @errors, $c->stash->{photo_error}
@@ -262,7 +268,8 @@ sub process_questionnaire : Private {
 # Sent here from email token action. Simply load and display questionnaire.
 sub show : Private {
     my ( $self, $c ) = @_;
-    $c->forward( 'check_questionnaire' );
+    $c->forward( 'check_questionnaire', [ 'unanswered' ] );
+    $c->forward( 'record_state_change' );
     $c->forward( 'display' );
 }
 
@@ -279,13 +286,9 @@ sub display : Private {
 
     my $problem = $c->stash->{questionnaire}->problem;
 
-    ( $c->stash->{short_latitude}, $c->stash->{short_longitude} ) =
-      map { Utils::truncate_coordinate($_) }
-      ( $problem->latitude, $problem->longitude );
-
-    $c->stash->{updates} = [ $c->model('DB::Comment')->search(
-        { problem_id => $problem->id, state => 'confirmed' },
-        { order_by => 'confirmed' }
+    $c->stash->{updates} = [ $c->cobrand->updates->search(
+        { problem_id => $problem->id, "me.state" => 'confirmed' },
+        { order_by => 'me.confirmed' }
     )->all ];
 
     $c->stash->{page} = 'questionnaire';

@@ -7,21 +7,22 @@ $primary: $zurich_blue;
 $primary_b: $dark_blue;
 $primary_text: #fff;
 
+$link-color: #126094;
+$link-hover-color: lighten(#126094, 5%);
+
+$base_bg: #fff;
+$base_fg: #3c3c3c;
+
+$nav_background_colour: #366AB6;
+/* Unused here, main-nav is mobile only */
+$nav_colour: $primary_text;
+$nav_hover_background_colour: $primary/1.1;
+
 $col_click_map: $zurich_blue;
-$col_click_map_dark: darken($zurich_blue, 20%);
 
 $col_fixed_label: #648721;
-$col_fixed_label_dark: #4B8304;
 
 $mobile_menu_tab_bg_col: #FFFFFF; // the white border and tab on mobile site
 $mobile_header_blue: #366AB6; // close match to Zurich logo_portal.jpg
 
-// Zurich admin tables:
-
-$table_border_color:   #ccc;
-$table_heading_bg_col: #595959;
-$table_heading_border_col:   #7a7a7a;
-$table_heading_col:    #fff;
-$table_heading_underline_col: #393939;
-$button_col:    #fff;
-$button_bg_col: #a1a1a1;  // also search bar (tables)
+$header-top-border: solid 0.25em $mobile_menu_tab_bg_col;

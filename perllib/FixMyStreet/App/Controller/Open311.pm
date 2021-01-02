@@ -4,9 +4,10 @@ use utf8;
 use Moose;
 use namespace::autoclean;
 
-use JSON;
+use JSON::MaybeXS;
 use XML::Simple;
 use DateTime::Format::W3CDTF;
+use FixMyStreet::MapIt;
 
 BEGIN { extends 'Catalyst::Controller'; }
 
@@ -110,9 +111,7 @@ sub get_discovery : Private {
     {
         'contact' => ["Send email to $contact_email."],
         'changeset' => [$prod_changeset],
-        # XXX rewrite to match
-        'key_service' => ["Read access is open to all according to our \u003Ca href='/open_data' target='_blank'\u003Eopen data license\u003C/a\u003E. For write access either: 1. return the 'guid' cookie on each call (unique to each client) or 2. use an api key from a user account which can be generated here: http://seeclickfix.com/register The unversioned url will always point to the latest supported version."],
-        'max_requests' => [ $c->config->{RSS_LIMIT} ],
+        'max_requests' => [ $c->config->{OPEN311_LIMIT} || 1000 ],
         'endpoints' => [
             {
                 'endpoint' => [
@@ -155,18 +154,16 @@ sub get_discovery : Private {
 sub get_services : Private {
     my ( $self, $c ) = @_;
 
-    my $jurisdiction_id = $c->req->param('jurisdiction_id') || '';
-    my $lat = $c->req->param('lat') || '';
-    my $lon = $c->req->param('long') || '';
+    my $jurisdiction_id = $c->get_param('jurisdiction_id') || '';
+    my $lat = $c->get_param('lat') || '';
+    my $lon = $c->get_param('long') || '';
 
     # Look up categories for this council or councils
-    my $categories = $c->model('DB::Contact')->not_deleted;
+    my $categories = $c->model('DB::Contact')->active;
 
     if ($lat || $lon) {
         my $area_types = $c->cobrand->area_types;
-        my $all_areas = mySociety::MaPit::call('point',
-                                                  "4326/$lon,$lat",
-                                                  type => $area_types);
+        my $all_areas = FixMyStreet::MapIt::call('point', "4326/$lon,$lat", type => $area_types);
         $categories = $categories->search( {
             'body_areas.area_id' => [ keys %$all_areas ],
         }, { join => { 'body' => 'body_areas' } } );
@@ -196,17 +193,16 @@ sub get_services : Private {
             );
     }
     $c->forward( 'format_output', [ {
-        'services' => [ {
-            'service' => \@services
-        } ]
+        'services' => \@services
     } ] );
 }
 
 
 sub output_requests : Private {
     my ( $self, $c, $criteria, $limit ) = @_;
-    $limit = $c->config->{RSS_LIMIT}
-        unless $limit && $limit <= $c->config->{RSS_LIMIT};
+    my $default_limit = $c->config->{OPEN311_LIMIT} || 1000;
+    $limit = $default_limit
+        unless $limit && $limit <= $default_limit;
 
     my $attr = {
         order_by => { -desc => 'confirmed' },
@@ -214,7 +210,7 @@ sub output_requests : Private {
     };
 
     # Look up categories for this council or councils
-    my $problems = $c->cobrand->problems->search( $criteria, $attr );
+    my $problems = $c->stash->{rs}->search( $criteria, $attr );
 
     my %statusmap = (
         map( { $_ => 'open' } FixMyStreet::DB::Result::Problem->open_states() ),
@@ -224,43 +220,54 @@ sub output_requests : Private {
 
     my @problemlist;
     while ( my $problem = $problems->next ) {
+        $c->cobrand->call_hook(munge_problem_list => $problem);
+
         my $id = $problem->id;
 
         $problem->service( 'Web interface' ) unless $problem->service;
 
         $problem->state( $statusmap{$problem->state} );
 
+        my ($lat, $lon) = map { Utils::truncate_coordinate($_) } $problem->latitude, $problem->longitude;
         my $request =
         {
-            'service_request_id' => [ $id ],
-            'title' => [ $problem->title ], # Not in Open311 v2
-            'detail'  => [ $problem->detail ], # Not in Open311 v2
-            'description' => [ $problem->title .': ' . $problem->detail ],
-            'lat' => [ $problem->latitude ],
-            'long' => [ $problem->longitude ],
-            'status' => [ $problem->state ],
-#            'status_notes' => [ {} ],
-            'requested_datetime' => [ w3date($problem->confirmed_local) ],
-            'updated_datetime' => [ w3date($problem->lastupdate_local) ],
-#            'expected_datetime' => [ {} ],
-#            'address' => [ {} ],
-#            'address_id' => [ {} ],
-            'service_code' => [ $problem->category ],
-            'service_name' => [ $problem->category ],
-#            'service_notice' => [ {} ],
-            'agency_responsible' =>  $problem->bodies , # FIXME Not according to Open311 v2
-#            'zipcode' => [ {} ],
-            'interface_used' => [ $problem->service ], # Not in Open311 v2
+            'service_request_id' => $id,
+            'title' => $problem->title, # Not in Open311 v2
+            'detail'  => $problem->detail, # Not in Open311 v2
+            'description' => $problem->title .': ' . $problem->detail,
+            'lat' => $lat,
+            'long' => $lon,
+            'status' => $problem->state,
+#            'status_notes' => {},
+            # Zurich has visible unconfirmed reports
+            'requested_datetime' => w3date($problem->confirmed || $problem->created),
+            'updated_datetime' => w3date($problem->lastupdate),
+#            'expected_datetime' => {},
+#            'address' => {},
+#            'address_id' => {},
+            'service_code' => $problem->category,
+            'service_name' => $problem->category,
+#            'service_notice' => {},
+#            'zipcode' => {},
+            'interface_used' => $problem->service, # Not in Open311 v2
         };
+
+        if ( $c->cobrand->moniker eq 'zurich' ) {
+            $request->{service_notice} = $problem->get_extra_metadata('public_response');
+        }
+        else {
+            # FIXME Not according to Open311 v2
+            my $body_names = $problem->body_names;
+            $request->{agency_responsible} = {'recipient' => $body_names };
+        }
 
         if ( !$problem->anonymous ) {
             # Not in Open311 v2
-            $request->{'requestor_name'} = [ $problem->name ];
+            $request->{'requestor_name'} = $problem->name;
         }
         if ( $problem->whensent ) {
             # Not in Open311 v2
-            $request->{'agency_sent_datetime'} =
-                [ w3date($problem->whensent_local) ];
+            $request->{'agency_sent_datetime'} = w3date($problem->whensent);
         }
 
         # Extract number of updates
@@ -269,29 +276,20 @@ sub output_requests : Private {
         )->count;
         if ($updates) {
             # Not in Open311 v2
-            $request->{'comment_count'} = [ $updates ];
+            $request->{'comment_count'} = $updates;
         }
 
-        my $display_photos = $c->cobrand->allow_photo_display;
+        my $display_photos = $c->cobrand->allow_photo_display($problem);
         if ($display_photos && $problem->photo) {
             my $url = $c->cobrand->base_url();
-            my $imgurl = $url . "/photo/$id.full.jpeg";
-            $request->{'media_url'} = [ $imgurl ];
+            my $imgurl = $url . $problem->photos->[$display_photos-1]->{url_full};
+            $request->{'media_url'} = $imgurl;
         }
         push(@problemlist, $request);
     }
 
-    foreach my $request (@problemlist) {
-        if ($request->{agency_responsible}) {
-            my @body_names = map { $_->name } values %{$request->{agency_responsible}} ;
-            $request->{agency_responsible} =
-                [ {'recipient' => [ @body_names ] } ];
-        }
-    }
     $c->forward( 'format_output', [ {
-        'requests' => [ {
-            'request' => \@problemlist
-        } ]
+        service_requests => \@problemlist
     } ] );
 }
 
@@ -300,11 +298,15 @@ sub get_requests : Private {
 
     $c->forward( 'is_jurisdiction_id_ok' );
 
-    my $max_requests = $c->req->param('max_requests') || 0;
+    my $max_requests = $c->get_param('max_requests') || 0;
 
     # Only provide access to the published reports
+    my $states = FixMyStreet::DB::Result::Problem->visible_states();
+    delete $states->{unconfirmed};
+    delete $states->{submitted};
     my $criteria = {
-        state => [ FixMyStreet::DB::Result::Problem->visible_states() ]
+        state => [ keys %$states ],
+        non_public => 0,
     };
 
     my %rules = (
@@ -316,31 +318,15 @@ sub get_requests : Private {
         has_photo          => [ '=', 'photo' ],
     );
     for my $param (keys %rules) {
-        my $value = $c->req->param($param);
+        my $value = $c->get_param($param);
         next unless $value;
         my $op  = $rules{$param}[0];
         my $key = $rules{$param}[1];
         if ( 'status' eq $param ) {
             $value = {
                 'open' => [ FixMyStreet::DB::Result::Problem->open_states() ],
-                'closed' => [ FixMyStreet::DB::Result::Problem->fixed_states(), 'closed' ],
+                'closed' => [ FixMyStreet::DB::Result::Problem->fixed_states(), FixMyStreet::DB::Result::Problem->closed_states() ],
             }->{$value};
-        } elsif ( 'agency_responsible' eq $param ) {
-            my @valuelist;
-            for my $agency (split(/\|/, $value)) {
-                unless ($agency =~ m/^(\d+)$/) {
-                    $c->detach( 'error', [
-                        sprintf(_('Invalid agency_responsible value %s'),
-                            $value)
-                    ] );
-                }
-                my $agencyid = $1;
-                # FIXME This seem to match the wrong entries
-                # some times.  Not sure when or why
-                my $re = "(\\y$agencyid\\y|^$agencyid\\y|\\y$agencyid\$)";
-                push(@valuelist, $re);
-            }
-            $value = \@valuelist;
         } elsif ( 'has_photo' eq $param ) {
             $value = undef;
             $op = '!=' if 'true' eq $value;
@@ -355,12 +341,17 @@ sub get_requests : Private {
         $criteria->{$key} = { $op, $value };
     }
 
-    if ( $c->req->param('start_date') and $c->req->param('end_date') ) {
-        $criteria->{confirmed} = [ '-and' => { '>=', $c->req->param('start_date') }, { '<', $c->req->param('end_date') } ];
-    } elsif ( $c->req->param('start_date') ) {
-        $criteria->{confirmed} = { '>=', $c->req->param('start_date') };
-    } elsif ( $c->req->param('end_date') ) {
-        $criteria->{confirmed} = { '<', $c->req->param('end_date') };
+    if ( $c->get_param('start_date') and $c->get_param('end_date') ) {
+        $criteria->{confirmed} = [ '-and' => { '>=', $c->get_param('start_date') }, { '<', $c->get_param('end_date') } ];
+    } elsif ( $c->get_param('start_date') ) {
+        $criteria->{confirmed} = { '>=', $c->get_param('start_date') };
+    } elsif ( $c->get_param('end_date') ) {
+        $criteria->{confirmed} = { '<', $c->get_param('end_date') };
+    }
+
+    $c->stash->{rs} = $c->cobrand->problems;
+    if (my $bodies = $c->get_param('agency_responsible')) {
+        $c->stash->{rs} = $c->stash->{rs}->to_body([ split(/\|/, $bodies) ]);
     }
 
     if ('rss' eq $c->stash->{format}) {
@@ -384,7 +375,7 @@ sub rss_query : Private {
         rows => $limit
     };
 
-    my $problems = $c->cobrand->problems->search( $criteria, $attr );
+    my $problems = $c->stash->{rs}->search( $criteria, $attr );
     $c->stash->{problems} = $problems;
 }
 
@@ -403,22 +394,42 @@ sub get_request : Private {
         return;
     }
 
+    my $states = FixMyStreet::DB::Result::Problem->visible_states();
+    delete $states->{unconfirmed};
+    delete $states->{submitted};
     my $criteria = {
-        state => [ FixMyStreet::DB::Result::Problem->visible_states() ],
+        state => [ keys %$states ],
         id => $id,
+        non_public => 0,
     };
+    $c->stash->{rs} = $c->cobrand->problems;
     $c->forward( 'output_requests', [ $criteria ] );
 }
 
 sub format_output : Private {
     my ( $self, $c, $hashref ) = @_;
     my $format = $c->stash->{format};
+    $c->response->header('Access-Control-Allow-Origin' => '*');
     if ('json' eq $format) {
         $c->res->content_type('application/json; charset=utf-8');
         $c->res->body( encode_json($hashref) );
     } elsif ('xml' eq $format) {
         $c->res->content_type('application/xml; charset=utf-8');
-        $c->res->body( XMLout($hashref, RootName => undef) );
+        my $group_tags = {
+            services => 'service',
+            attributes => 'attribute',
+            values => 'value',
+            service_requests => 'request',
+            errors => 'error',
+            service_request_updates => 'request_update',
+        };
+        $c->res->body( XMLout($hashref,
+            KeyAttr => {},
+            GroupTags => $group_tags,
+            SuppressEmpty => undef,
+            RootName => undef,
+            NoAttr => 1,
+        ) );
     } else {
         $c->detach( 'error', [
             sprintf(_('Invalid format %s specified.'), $format)
@@ -428,18 +439,17 @@ sub format_output : Private {
 
 sub is_jurisdiction_id_ok : Private {
     my ( $self, $c ) = @_;
-    unless (my $jurisdiction_id = $c->req->param('jurisdiction_id')) {
+    unless (my $jurisdiction_id = $c->get_param('jurisdiction_id')) {
         $c->detach( 'error', [ _('Missing jurisdiction_id') ] );
     }
 }
 
 # Input:  DateTime object
 # Output: 2011-04-23T10:28:55+02:00
-# FIXME Need generic solution to find time zone
 sub w3date : Private {
     my $datestr = shift;
     return unless $datestr;
-    return DateTime::Format::W3CDTF->format_datetime($datestr);
+    return DateTime::Format::W3CDTF->format_datetime($datestr->truncate(to => 'second'));
 }
 
 =head1 AUTHOR

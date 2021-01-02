@@ -1,38 +1,55 @@
+[% no_edit = no_edit AND NOT c.req.params.internal ~%]
+
 [%- FOR problem IN problems %]
     [% SET p_body = problem.bodies.values.0 %]
-    [% IF page == 'search' %]
-        [% NEXT IF admin_type == 'sdm' AND p_body.id != body.id %]
-        [% NEXT IF admin_type == 'dm' AND p_body.id != body.id AND p_body.parent.id != body.id %]
-    [% END %]
     <tr[%
-        ' class="adminhidden"' IF problem.state == 'hidden';
-        ' class="overdue"' IF c.cobrand.overdue( problem );
+        SET classes = [];
+        classes.push('adminhidden') IF problem.state == 'hidden';
+        classes.push('overdue') IF c.cobrand.get_or_check_overdue( problem );
+        classes.push('row-link') IF NOT no_edit;
+        ' class="' _ classes.join(' ') _ '"' IF classes.size;
     %]>
-        <td class="record-id">[%- IF problem.is_visible -%]
-        <a href="[% c.uri_for_email( '/report', problem.id ) %]">[% problem.id %]</a>
-        [%- ELSE %]
-        [%- problem.id %]
-        [%- END -%]</td>
+        <td class="record-id">
+          [% IF no_edit AND problem.is_visible %]
+            <a href="[% c.uri_for_email( '/report', problem.id ) %]">[% problem.id %]</a>
+          [% ELSE %]
+            [% problem.id %]
+          [% END %]
+        </td>
         <td>[% PROCESS value_or_nbsp value=problem.title %]</td>
-        <td>[% PROCESS value_or_nbsp value=problem.category %]</td>
+        <td>[% PROCESS value_or_nbsp value=problem.category_display %]</td>
         <td>[% PROCESS format_date this_date=problem.created %]</td>
         <td>[% PROCESS format_date this_date=problem.lastupdate %]</td>
-        <td>[% states.${problem.state} %]</td>
+        <td>[% prettify_state(problem.state) %]
+            [% IF problem.state == 'feedback pending';
+            SET cs=problem.get_extra_metadata('closure_status');
+            IF cs %] ([% prettify_state(cs) %]) [% END; END %]
+            [% IF problem.non_public %]<br><i>Interne Meldung</i>[% END %]</td>
 
         [% IF include_subdiv %]
             <td>
                 [%- IF p_body.parent.parent.id -%][%# ...it's a subdivision %]
                     [% PROCESS value_or_nbsp value=p_body.name %]
                 [%- ELSIF problem.external_body %]
-                    [% PROCESS value_or_nbsp value=problem.body(c).name %]
+                    [% PROCESS value_or_nbsp value=problem.body.name %]
                 [%- ELSE -%]
                     &nbsp;
                 [%- END -%]
             </td>
         [% END %]
 
+        <td>
+        [% IF problem.photo %]
+            [% FOR photo IN problem.photos %]
+            <div class="update-img">
+                <img height="60" width="90" alt="" src="[% c.cobrand.base_url %][% photo.url_temp %]">
+            </div>
+            [% END %]
+        [% END %]
+        </td>
+
         [% IF NOT no_edit %]
-            <td><a href="[% c.uri_for( 'report_edit', problem.id ) %]">[% loc('Edit') %]</a></td>
+            <td><a href="[% c.uri_for_action( 'admin/reports/edit', [ problem.id ] ) %]">[% loc('Edit') %]</a></td>
         [% END %]
     </tr>
 [%- END -%]

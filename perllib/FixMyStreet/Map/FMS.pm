@@ -1,5 +1,3 @@
-#!/usr/bin/perl
-#
 # FixMyStreet:Map::FMS
 # Bing and OS StreetView maps on FixMyStreet, using OpenLayers.
 #
@@ -7,60 +5,45 @@
 # Email: matthew@mysociety.org; WWW: http://www.mysociety.org/
 
 package FixMyStreet::Map::FMS;
-use base 'FixMyStreet::Map::OSM';
+use base 'FixMyStreet::Map::Bing';
 
 use strict;
 
-# Is set by the JavaScript
-sub map_type {
-    return '""';
-}
+use constant ZOOM_LEVELS => 6;
 
-sub map_template {
-    return 'fms';
-}
+sub map_template { 'fms' }
 
-sub copyright {
-    return '';
-}
+sub map_javascript { [
+    '/vendor/OpenLayers/OpenLayers.wfs.js',
+    '/js/map-OpenLayers.js',
+    '/js/map-bing-ol.js',
+    '/js/map-fms.js',
+] }
 
-sub get_quadkey {
-    my ($x, $y, $z) = @_;
-    my $key = '';
-    for (my $i = $z; $i > 0; $i--) {
-        my $digit = 0;
-        my $mask = 1 << ($i - 1);
-        $digit++ if ($x & $mask) != 0;
-        $digit += 2 if ($y & $mask) != 0;
-        $key .= $digit;
-    }
-    return $key;
-}
-
-sub map_tile_base {
-    '.', "http://%stilma.mysociety.org/sv/%d/%d/%d.png";
-}
+sub map_tile_base { "oml" }
 
 sub map_tiles {
     my ( $self, %params ) = @_;
     my ( $x, $y, $z ) = ( $params{x_tile}, $params{y_tile}, $params{zoom_act} );
     my $ni = in_northern_ireland_box( $params{latitude}, $params{longitude} );
-    if (!$ni && $z >= 16) {
-        my ($tile_sep, $tile_base) = $self->map_tile_base;
+    if ($params{aerial} || $ni || $z <= 11) {
+        return $self->SUPER::map_tiles(%params);
+    } elsif ($z >= 16) {
+        my $tile_base = '//%stilma.mysociety.org/' . $self->map_tile_base . '/%d/%d/%d.png';
         return [
-            sprintf($tile_base, 'a' . $tile_sep, $z, $x-1, $y-1),
-            sprintf($tile_base, 'b' . $tile_sep, $z, $x, $y-1),
-            sprintf($tile_base, 'c' . $tile_sep, $z, $x-1, $y),
+            sprintf($tile_base, 'a-', $z, $x-1, $y-1),
+            sprintf($tile_base, 'b-', $z, $x, $y-1),
+            sprintf($tile_base, 'c-', $z, $x-1, $y),
             sprintf($tile_base, '', $z, $x, $y),
         ];
-    } else {
-        my $url = "g=701";
-        $url .= "&productSet=mmOS" if $z > 10 && !$ni;
+    } elsif ($z > 11) {
+        my $key = FixMyStreet->config('BING_MAPS_API_KEY');
+        my $base = "//ecn.%s.tiles.virtualearth.net/tiles/r%s?g=8702&lbl=l1&productSet=mmOS&key=$key";
         return [
-            "//ecn.t0.tiles.virtualearth.net/tiles/r" . get_quadkey($x-1, $y-1, $z) . ".png?$url",
-            "//ecn.t1.tiles.virtualearth.net/tiles/r" . get_quadkey($x,   $y-1, $z) . ".png?$url",
-            "//ecn.t2.tiles.virtualearth.net/tiles/r" . get_quadkey($x-1, $y,   $z) . ".png?$url",
-            "//ecn.t3.tiles.virtualearth.net/tiles/r" . get_quadkey($x,   $y,   $z) . ".png?$url",
+            sprintf($base, "t0", $self->get_quadkey($x-1, $y-1, $z)),
+            sprintf($base, "t1", $self->get_quadkey($x,   $y-1, $z)),
+            sprintf($base, "t2", $self->get_quadkey($x-1, $y,   $z)),
+            sprintf($base, "t3", $self->get_quadkey($x,   $y,   $z)),
         ];
     }
 }

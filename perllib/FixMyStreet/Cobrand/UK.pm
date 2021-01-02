@@ -1,17 +1,25 @@
 package FixMyStreet::Cobrand::UK;
 use base 'FixMyStreet::Cobrand::Default';
+use strict;
 
+use Encode;
+use JSON::MaybeXS;
+use LWP::UserAgent;
+use Path::Tiny;
+use Time::Piece;
 use mySociety::MaPit;
 use mySociety::VotingArea;
-
-sub path_to_web_templates {
-    my $self = shift;
-    return [ FixMyStreet->path_to( 'templates/web', $self->moniker )->stringify ];
-}
+use Utils;
+use HighwaysEngland;
 
 sub country             { return 'GB'; }
 sub area_types          { [ 'DIS', 'LBO', 'MTD', 'UTA', 'CTY', 'COI', 'LGD' ] }
 sub area_types_children { $mySociety::VotingArea::council_child_types }
+
+sub csp_config {
+    my $self = shift;
+    return $self->feature('content_security_policy');
+}
 
 sub enter_postcode_text {
     my ( $self ) = @_;
@@ -31,28 +39,17 @@ sub disambiguate_location {
     };
 }
 
-sub _fallback_body_sender {
-    my ( $self, $body, $category ) = @_;
-
-    my $first_area = $body->body_areas->first->area_id;
-    my $area_info = mySociety::MaPit::call('area', $first_area);
-    return { method => 'London' } if $area_info->{type} eq 'LBO';
-    return { method => 'NI' } if $area_info->{type} eq 'LGD';
-    return { method => 'Email' };
-}
-
-sub process_extras {
+sub process_open311_extras {
     my $self    = shift;
     my $ctx     = shift;
-    my $body_id = shift;
+    my $body = shift;
     my $extra   = shift;
     my $fields  = shift || [];
 
-    # XXX Hardcoded body ID matching mapit area ID
-    if ( $body_id eq '2482' ) {
+    if ( $body && $body->name =~ /Bromley/ ) {
         my @fields = ( 'fms_extra_title', @$fields );
         for my $field ( @fields ) {
-            my $value = $ctx->request->param( $field );
+            my $value = $ctx->get_param($field);
 
             if ( !$value ) {
                 $ctx->stash->{field_errors}->{ $field } = _('This information is required');
@@ -64,8 +61,8 @@ sub process_extras {
             };
         }
 
-        if ( $ctx->request->param('fms_extra_title') ) {
-            $ctx->stash->{fms_extra_title} = $ctx->request->param('fms_extra_title');
+        if ( $ctx->get_param('fms_extra_title') ) {
+            $ctx->stash->{fms_extra_title} = $ctx->get_param('fms_extra_title');
             $ctx->stash->{extra_name_info} = 1;
         }
     }
@@ -97,23 +94,10 @@ sub geocode_postcode {
             latitude  => $location->{wgs84_lat},
             longitude => $location->{wgs84_lon},
         };
+    } elsif (my $junction_location = HighwaysEngland::junction_lookup($s)) {
+        return $junction_location;
     }
     return {};
-}
-
-sub remove_redundant_areas {
-  my $self = shift;
-  my $all_areas = shift;
-
-  # Ipswich & St Edmundsbury are responsible for everything in their
-  # areas, not Suffolk
-  delete $all_areas->{2241}
-    if $all_areas->{2446}    #
-        || $all_areas->{2443};
-
-  # Norwich is responsible for everything in its areas, not Norfolk
-  delete $all_areas->{2233}    #
-    if $all_areas->{2391};
 }
 
 sub short_name {
@@ -126,35 +110,45 @@ sub short_name {
     return 'Durham+County' if $name eq 'Durham County Council';
     return 'Durham+City' if $name eq 'Durham City Council';
 
+    $name =~ s/^(Royal|London) Borough of //;
     $name =~ s/ (Borough|City|District|County) Council$//;
     $name =~ s/ Council$//;
     $name =~ s/ & / and /;
-    $name =~ s{/}{_}g;
+    $name =~ tr{/}{_};
     $name = URI::Escape::uri_escape_utf8($name);
     $name =~ s/%20/+/g;
     return $name;
 }
 
 sub find_closest {
-    my ( $self, $latitude, $longitude, $problem ) = @_;
+    my ($self, $data) = @_;
 
-    my $str = $self->SUPER::find_closest( $latitude, $longitude, $problem );
+    $data = { problem => $data } if ref $data ne 'HASH';
 
-    my $url = "http://mapit.mysociety.org/nearest/4326/$longitude,$latitude";
-    my $j = LWP::Simple::get($url);
-    if ($j) {
-        $j = JSON->new->utf8->allow_nonref->decode($j);
-        if ($j->{postcode}) {
-            $str .= sprintf(_("Nearest postcode to the pin placed on the map (automatically generated): %s (%sm away)"),
-                $j->{postcode}{postcode}, $j->{postcode}{distance}) . "\n\n";
-        }
+    my $problem = $data->{problem};
+    my $lat = $problem ? $problem->latitude : $data->{latitude};
+    my $lon = $problem ? $problem->longitude : $data->{longitude};
+
+    my $closest = $self->SUPER::find_closest($data);
+
+    ($lat, $lon) = map { Utils::truncate_coordinate($_) } $lat, $lon;
+    my $j = mySociety::MaPit::call('nearest', "4326/$lon,$lat");
+    if ($j->{postcode}) {
+        $closest->{postcode} = $j->{postcode};
     }
 
-    return $str;
+    return $closest;
 }
 
 sub reports_body_check {
     my ( $self, $c, $code ) = @_;
+
+    # Deal with Bexley and Greenwich name not starting with short name
+    if ($code =~ /bexley|greenwich/i) {
+        my $body = $c->model('DB::Body')->search( { name => { -like => "%$code%" } } )->single;
+        $c->stash->{body} = $body;
+        return $body;
+    }
 
     # Manual misspelling redirect
     if ($code =~ /^rhondda cynon taff$/i) {
@@ -192,6 +186,7 @@ sub reports_body_check {
         }
     }
 
+    return;
 }
 
 sub council_rss_alert_options {
@@ -206,9 +201,11 @@ sub council_rss_alert_options {
     my ( @options, @reported_to_options );
     if ( $num_councils == 1 or $num_councils == 2 ) {
         my ($council, $ward);
+        my $body = FixMyStreet::DB->resultset('Body')->active->search({ name => { '!=' => 'TfL' } })->for_areas(keys %$all_areas)->first;
         foreach (values %$all_areas) {
             if ($councils{$_->{type}}) {
                 $council = $_;
+                $council->{id} = $body->id; # Want to use body ID, not MapIt area ID
                 $council->{short_name} = $self->short_name( $council );
                 ( $council->{id_name} = $council->{short_name} ) =~ tr/+/_/;
             } else {
@@ -263,57 +260,63 @@ sub council_rss_alert_options {
         my $county_name = $county->{name};
         my $c_ward_name = $c_ward->{name};
 
+        my $body_dis = FixMyStreet::DB->resultset('Body')->active->for_areas($district->{id})->first;
+        my $body_cty = FixMyStreet::DB->resultset('Body')->active->for_areas($county->{id})->first;
+
         push @options, {
             type  => 'area',
             id    => sprintf( 'area:%s:%s', $district->{id}, $district->{id_name} ),
-            text  => $district_name,
+            text  => sprintf( _('Problems within %s'), $district_name ),
             rss_text => sprintf( _('RSS feed for %s'), $district_name ),
             uri => $c->uri_for( '/rss/area/' . $district->{short_name}  )
         }, {
             type      => 'area',
             id        => sprintf( 'area:%s:%s:%s:%s', $district->{id}, $d_ward->{id}, $district->{id_name}, $d_ward->{id_name} ),
-            text      => sprintf( _('%s ward, %s'), $d_ward_name, $district_name ),
+            text      => sprintf( _('Problems within %s ward, %s'), $d_ward_name, $district_name ),
             rss_text  => sprintf( _('RSS feed for %s ward, %s'), $d_ward_name, $district_name ),
             uri       => $c->uri_for( '/rss/area/' . $district->{short_name} . '/' . $d_ward->{short_name} )
         }, {
             type  => 'area',
             id    => sprintf( 'area:%s:%s', $county->{id}, $county->{id_name} ),
-            text  => $county_name,
+            text  => sprintf( _('Problems within %s'), $county_name ),
             rss_text => sprintf( _('RSS feed for %s'), $county_name ),
             uri => $c->uri_for( '/rss/area/' . $county->{short_name}  )
         }, {
             type      => 'area',
             id        => sprintf( 'area:%s:%s:%s:%s', $county->{id}, $c_ward->{id}, $county->{id_name}, $c_ward->{id_name} ),
-            text      => sprintf( _('%s ward, %s'), $c_ward_name, $county_name ),
+            text      => sprintf( _('Problems within %s ward, %s'), $c_ward_name, $county_name ),
             rss_text  => sprintf( _('RSS feed for %s ward, %s'), $c_ward_name, $county_name ),
             uri       => $c->uri_for( '/rss/area/' . $county->{short_name} . '/' . $c_ward->{short_name} )
         };
 
         push @reported_to_options, {
             type      => 'council',
-            id        => sprintf( 'council:%s:%s', $district->{id}, $district->{id_name} ),
-            text      => $district->{name},
+            id        => sprintf( 'council:%s:%s', $body_dis->id, $district->{id_name} ),
+            text      => sprintf( _('Reports sent to %s'), $district->{name} ),
             rss_text  => sprintf( _('RSS feed of %s'), $district->{name}),
             uri       => $c->uri_for( '/rss/reports/' . $district->{short_name} ),
         }, {
             type     => 'ward',
-            id       => sprintf( 'ward:%s:%s:%s:%s', $district->{id}, $d_ward->{id}, $district->{id_name}, $d_ward->{id_name} ),
+            id       => sprintf( 'ward:%s:%s:%s:%s', $body_dis->id, $d_ward->{id}, $district->{id_name}, $d_ward->{id_name} ),
             rss_text => sprintf( _('RSS feed of %s, within %s ward'), $district->{name}, $d_ward->{name}),
-            text     => sprintf( _('%s, within %s ward'), $district->{name}, $d_ward->{name}),
+            text     => sprintf( _('Reports sent to %s, within %s ward'), $district->{name}, $d_ward->{name}),
             uri      => $c->uri_for( '/rss/reports/' . $district->{short_name} . '/' . $d_ward->{short_name} ),
-        }, {
+        }
+            if $body_dis;
+        push @reported_to_options, {
             type      => 'council',
-            id        => sprintf( 'council:%s:%s', $county->{id}, $county->{id_name} ),
-            text      => $county->{name},
+            id        => sprintf( 'council:%s:%s', $body_cty->id, $county->{id_name} ),
+            text      => sprintf( _('Reports sent to %s'), $county->{name} ),
             rss_text  => sprintf( _('RSS feed of %s'), $county->{name}),
             uri       => $c->uri_for( '/rss/reports/' . $county->{short_name} ),
         }, {
             type     => 'ward',
-            id       => sprintf( 'ward:%s:%s:%s:%s', $county->{id}, $c_ward->{id}, $county->{id_name}, $c_ward->{id_name} ),
+            id       => sprintf( 'ward:%s:%s:%s:%s', $body_cty->id, $c_ward->{id}, $county->{id_name}, $c_ward->{id_name} ),
             rss_text => sprintf( _('RSS feed of %s, within %s ward'), $county->{name}, $c_ward->{name}),
-            text     => sprintf( _('%s, within %s ward'), $county->{name}, $c_ward->{name}),
+            text     => sprintf( _('Reports sent to %s, within %s ward'), $county->{name}, $c_ward->{name}),
             uri      => $c->uri_for( '/rss/reports/' . $county->{short_name} . '/' . $c_ward->{short_name} ),
-        };
+        }
+            if $body_cty;
 
     } else {
         throw Error::Simple('An area with three tiers of council? Impossible! '. join('|',keys %$all_areas));
@@ -322,5 +325,177 @@ sub council_rss_alert_options {
     return ( \@options, @reported_to_options ? \@reported_to_options : undef );
 }
 
-1;
+sub report_check_for_errors {
+    my $self = shift;
+    my $c = shift;
 
+    my %errors = $self->next::method($c);
+
+    my $report = $c->stash->{report};
+
+    if (!$errors{name} && (length($report->name) < 5
+        || $report->name !~ m/\s/
+        || $report->name =~ m/\ba\s*n+on+((y|o)mo?u?s)?(ly)?\b/i))
+    {
+        $errors{name} = _(
+'Please enter your full name, councils need this information – if you do not wish your name to be shown on the site, untick the box below'
+        );
+    }
+
+    my $cobrand = $self->get_body_handler_for_problem($report);
+    if ( $cobrand->can('report_validation') ) {
+        $cobrand->report_validation( $report, \%errors );
+    }
+
+    return %errors;
+}
+
+=head2 get_body_handler_for_problem
+
+Returns a cobrand for the body that a problem was logged against.
+
+    my $handler = $cobrand->get_body_handler_for_problem($row);
+    my $handler = $cobrand_class->get_body_handler_for_problem($row);
+
+If the UK council in bodies_str has a FMS.com cobrand then an instance of that
+cobrand class is returned, otherwise the default FixMyStreet cobrand is used.
+
+=cut
+
+sub get_body_handler_for_problem {
+    my ($self, $row) = @_;
+
+    if ($row->to_body_named('TfL')) {
+        return FixMyStreet::Cobrand::TfL->new;
+    }
+    # Do not do anything for Highways England here, as we don't want it to
+    # treat this as a cobrand for e.g. submit report emails made on .com
+
+    my @bodies = values %{$row->bodies};
+    my %areas = map { %{$_->areas} } grep { $_->name !~ /TfL|Highways England/ } @bodies;
+
+    my $cobrand = FixMyStreet::Cobrand->body_handler(\%areas);
+    return $cobrand if $cobrand;
+    return ref $self ? $self : $self->new;
+}
+
+=head2 link_to_council_cobrand
+
+If a problem was sent to a UK council who has a FMS cobrand and the report is
+currently being viewed on a different cobrand, then link the council's name to
+that problem on the council's cobrand.
+
+=cut
+
+sub link_to_council_cobrand {
+    my ( $self, $problem ) = @_;
+    # If the report was sent to a cobrand that we're not currently on,
+    # include a link to view it on the responsible cobrand.
+    # This only occurs if the report was sent to a single body and we're not already
+    # using the body name as a link to all problem reports.
+    my $handler = $self->get_body_handler_for_problem($problem);
+    $self->{c}->log->debug( sprintf "bodies: %s areas: %s self: %s handler: %s", $problem->bodies_str, $problem->areas, $self->moniker, $handler->moniker );
+    my $bodies_str_ids = $problem->bodies_str_ids;
+    if ( !FixMyStreet->config('AREA_LINKS_FROM_PROBLEMS') &&
+         scalar(@$bodies_str_ids) == 1 && $handler->is_council &&
+         $handler->moniker ne $self->{c}->cobrand->moniker
+       ) {
+        my $url = sprintf("%s%s", $handler->base_url, $problem->url);
+        return sprintf("<a href='%s'>%s</a>", $url, $problem->body);
+    } else {
+        return $problem->body;
+    }
+}
+
+sub lookup_by_ref_regex {
+    return qr/^\s*(\d+)\s*$/;
+}
+
+sub report_new_munge_before_insert {
+    my ($self, $report) = @_;
+
+    if ($report->to_body_named('TfL')) {
+        my $tfl = FixMyStreet::Cobrand->get_class_for_moniker('tfl')->new();
+        $tfl->report_new_munge_before_insert($report);
+    }
+}
+
+# To use recaptcha, add a RECAPTCHA key to your config, with subkeys secret and
+# site_key, taken from the recaptcha site. This shows it to non-UK IP addresses
+# on alert and report pages.
+
+sub requires_recaptcha {
+    my $self = shift;
+    my $c = $self->{c};
+
+    return 0 if $c->user_exists;
+    return 0 if !FixMyStreet->config('RECAPTCHA');
+    return 0 unless $c->action =~ /^(alert|report|around)/;
+    return 0 if $c->user_country eq 'GB';
+    return 1;
+}
+
+sub check_recaptcha {
+    my $self = shift;
+    my $c = $self->{c};
+
+    return unless $self->requires_recaptcha;
+
+    my $url = 'https://www.google.com/recaptcha/api/siteverify';
+    my $res = LWP::UserAgent->new->post($url, {
+        secret => FixMyStreet->config('RECAPTCHA')->{secret},
+        response => $c->get_param('g-recaptcha-response'),
+        remoteip => $c->req->address,
+    });
+    $res = decode_json($res->content);
+    $c->detach('/page_error_400_bad_request', ['Bad recaptcha'])
+        unless $res->{success};
+}
+
+sub public_holidays {
+    my $nation = shift || 'england-and-wales';
+    my $json = _get_bank_holiday_json();
+    return [ map { $_->{date} } @{$json->{$nation}{events}} ];
+}
+
+sub is_public_holiday {
+    my %args = @_;
+    $args{date} ||= localtime;
+    $args{date} = $args{date}->date;
+    $args{nation} ||= 'england-and-wales';
+    my $json = _get_bank_holiday_json();
+    for my $event (@{$json->{$args{nation}}{events}}) {
+        if ($event->{date} eq $args{date}) {
+            return 1;
+        }
+    }
+}
+
+sub _get_bank_holiday_json {
+    my $file = 'bank-holidays.json';
+    my $cache_file = path(FixMyStreet->path_to("../data/$file"));
+    my $js;
+    if (-s $cache_file && -M $cache_file <= 7 && !FixMyStreet->config('STAGING_SITE')) {
+        # uncoverable statement
+        $js = $cache_file->slurp_utf8;
+    } else {
+        $js = _fetch_url("https://www.gov.uk/$file");
+        # uncoverable branch false
+        $js = decode_utf8($js) if !utf8::is_utf8($js);
+        if ($js && !FixMyStreet->config('STAGING_SITE')) {
+            # uncoverable statement
+            $cache_file->spew_utf8($js);
+        }
+    }
+    $js = JSON->new->decode($js) if $js;
+    return $js;
+}
+
+sub _fetch_url {
+    my $url = shift;
+    my $ua = LWP::UserAgent->new;
+    $ua->timeout(5);
+    $ua->get($url)->content;
+}
+
+1;

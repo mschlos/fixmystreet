@@ -3,14 +3,16 @@ package FixMyStreet::App::Controller::Rss;
 use Moose;
 use namespace::autoclean;
 use POSIX qw(strftime);
+use HTML::Entities qw();
 use URI::Escape;
 use XML::RSS;
 
-use mySociety::Gaze;
+use FixMyStreet::App::Model::PhotoSet;
+
+use FixMyStreet::Gaze;
 use mySociety::Locale;
-use mySociety::MaPit;
-use mySociety::Sundries qw(ordinal);
-use mySociety::Web qw(ent);
+use FixMyStreet::MapIt;
+use Lingua::EN::Inflect qw(ORD);
 
 BEGIN { extends 'Catalyst::Controller'; }
 
@@ -25,6 +27,10 @@ Catalyst Controller.
 =head1 METHODS
 
 =cut
+
+sub encode_entities {
+    HTML::Entities::encode_entities($_[0], '\x00-\x1f\x7f<>&"\'');
+}
 
 sub updates : LocalRegex('^(\d+)$') {
     my ( $self, $c ) = @_;
@@ -60,7 +66,7 @@ sub reports_in_area : LocalRegex('^area/(\d+)$') {
     my ( $self, $c ) = @_;
 
     my $id                    = $c->req->captures->[0];
-    my $area                  = mySociety::MaPit::call('area', $id);
+    my $area                  = FixMyStreet::MapIt::call('area', $id);
     $c->stash->{type}         = 'area_problems';
     $c->stash->{qs}           = '/' . $id;
     $c->stash->{db_params}    = [ $id ];
@@ -141,10 +147,10 @@ sub local_problems_ll : Private {
         $c->stash->{qs} .= ";d=$d";
         $d = 100 if $d > 100;
     } else {
-        $d = mySociety::Gaze::get_radius_containing_population( $lat, $lon, 200000 );
-        $d = int( $d * 10 + 0.5 ) / 10;
-        mySociety::Locale::in_gb_locale {
-            $d = sprintf("%f", $d);
+        $d = FixMyStreet::Gaze::get_radius_containing_population($lat, $lon);
+        # Needs to be with a '.' for db passing
+        $d = mySociety::Locale::in_gb_locale {
+            sprintf("%f", $d);
         }
     }
 
@@ -160,7 +166,6 @@ sub local_problems_ll : Private {
 
 sub output : Private {
     my ( $self, $c ) = @_;
-    $c->detach( '/page_error_404_not_found', [ 'Feed not found' ] ) if $c->cobrand->moniker eq 'emptyhomes';
     $c->forward( 'lookup_type' );
     $c->forward( 'query_main' );
     $c->forward( 'generate' );
@@ -181,6 +186,7 @@ sub generate : Private {
     $c->stash->{rss} = new XML::RSS(
         version       => '2.0',
         encoding      => 'UTF-8',
+        stylesheet    => '/rss/xsl',
         encode_output => undef
     );
     $c->stash->{rss}->add_module(
@@ -206,6 +212,7 @@ sub generate : Private {
     $out =~ s{(<link>.*?</link>)}{$1<uri>$uri</uri>};
 
     $c->response->header('Content-Type' => 'application/xml; charset=utf-8');
+    $c->response->header('Access-Control-Allow-Origin' => '*');
     $c->response->body( $out );
 }
 
@@ -216,9 +223,12 @@ sub query_main : Private {
     # FIXME Do this in a nicer way at some point in the future...
     my $query = 'select * from ' . $alert_type->item_table . ' where '
         . ($alert_type->head_table ? $alert_type->head_table . '_id=? and ' : '')
-        . $alert_type->item_where . ' order by '
-        . $alert_type->item_order;
-    my $rss_limit = mySociety::Config::get('RSS_LIMIT');
+        . $alert_type->item_where . ' ';
+    if ($c->cobrand->can('problems_sql_restriction')) {
+        $query .= $c->cobrand->problems_sql_restriction($alert_type->item_table);
+    }
+    $query .= ' order by ' . $alert_type->item_order;
+    my $rss_limit = FixMyStreet->config('RSS_LIMIT');
     $query .= " limit $rss_limit" unless $c->stash->{type} =~ /^all/;
 
     my $q = $c->model('DB::Alert')->result_source->storage->dbh->prepare($query);
@@ -248,7 +258,7 @@ sub add_row : Private {
         };
         $row->{created} = strftime("%e %B", $6, $5, $4, $3, $2-1, $1-1900, -1, -1, 0);
         $row->{created} =~ s/^\s+//;
-        $row->{created} =~ s/^(\d+)/ordinal($1)/e if $c->stash->{lang_code} eq 'en-gb';
+        $row->{created} =~ s/^(\d+)/ORD($1)/e if $c->stash->{lang_code} eq 'en-gb';
     }
     if ($row->{confirmed}) {
         $row->{confirmed} =~ /^(\d\d\d\d)-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)/;
@@ -257,42 +267,43 @@ sub add_row : Private {
         };
         $row->{confirmed} = strftime("%e %B", $6, $5, $4, $3, $2-1, $1-1900, -1, -1, 0);
         $row->{confirmed} =~ s/^\s+//;
-        $row->{confirmed} =~ s/^(\d+)/ordinal($1)/e if $c->stash->{lang_code} eq 'en-gb';
+        $row->{confirmed} =~ s/^(\d+)/ORD($1)/e if $c->stash->{lang_code} eq 'en-gb';
     }
 
-    (my $title = _($alert_type->item_title)) =~ s/{{(.*?)}}/$row->{$1}/g;
-    (my $link = $alert_type->item_link) =~ s/{{(.*?)}}/$row->{$1}/g;
-    (my $desc = _($alert_type->item_description)) =~ s/{{(.*?)}}/$row->{$1}/g;
+    (my $title = _($alert_type->item_title)) =~ s/\{\{(.*?)}}/$row->{$1}/g;
+    (my $link = $alert_type->item_link) =~ s/\{\{(.*?)}}/$row->{$1}/g;
+    (my $desc = _($alert_type->item_description)) =~ s/\{\{(.*?)}}/$row->{$1}/g;
 
-    my $hashref_restriction = $c->cobrand->site_restriction;
-    my $base_url = $c->cobrand->base_url;
-    if ( $hashref_restriction && $hashref_restriction->{bodies_str} && $row->{bodies_str} && $row->{bodies_str} ne $hashref_restriction->{bodies_str} ) {
-        $base_url = $c->config->{BASE_URL};
-    }
+    my $base_url = $c->cobrand->base_url_for_report($row);
     my $url = $base_url . $link;
 
     my %item = (
-        title => ent($title),
+        title => encode_entities($title),
         link => $url,
         guid => $url,
-        description => ent(ent($desc)) # Yes, double-encoded, really.
+        description => encode_entities(encode_entities($desc)) # Yes, double-encoded, really.
     );
     $item{pubDate} = $pubDate if $pubDate;
-    $item{category} = $row->{category} if $row->{category};
+    $item{category} = encode_entities($row->{category}) if $row->{category};
 
-    if ($c->cobrand->allow_photo_display && $row->{photo}) {
+    if ((my $photo_to_show = $c->cobrand->allow_photo_display($row)) && $row->{photo}) {
+        # Bit yucky as we don't have full objects here
+        my $photoset = FixMyStreet::App::Model::PhotoSet->new({ db_data => $row->{photo} });
+        my $idx = $photo_to_show - 1;
+        my $first_fn = $photoset->get_id($idx);
+        my ($hash, $format) = split /\./, $first_fn;
+        my $cachebust = substr($hash, 0, 8);
         my $key = $alert_type->item_table eq 'comment' ? 'c/' : '';
-        $item{description} .= ent("\n<br><img src=\"". $base_url . "/photo/$key$row->{id}.jpeg\">");
+        $item{description} .= encode_entities("\n<br><img src=\"". $base_url . "/photo/$key$row->{id}.$idx.$format?$cachebust\">");
     }
 
     if ( $row->{used_map} ) {
-        my $address = $c->cobrand->find_closest_address_for_rss( $row->{latitude}, $row->{longitude}, $row );
-        $item{description} .= ent("\n<br>$address") if $address;
+        my $address = $c->cobrand->find_closest_address_for_rss($row);
+        $item{description} .= encode_entities("\n<br>$address") if $address;
     }
 
-    my $recipient_name = $c->cobrand->contact_name;
-    $item{description} .= ent("\n<br><a href='$url'>" .
-        sprintf(_("Report on %s"), $recipient_name) . "</a>");
+    $item{description} .= encode_entities("\n<br><a href='$url'>" .
+        sprintf(_("Report on %s"), $c->stash->{site_name}) . "</a>");
 
     if ($row->{latitude} || $row->{longitude}) {
         $item{georss} = { point => "$row->{latitude} $row->{longitude}" };
@@ -320,15 +331,16 @@ sub add_parameters : Private {
     foreach ( keys %{ $c->stash->{title_params} } ) {
         $row->{$_} = $c->stash->{title_params}->{$_};
     }
+    $row->{SITE_NAME} = $c->stash->{site_name};
 
-    (my $title = _($alert_type->head_title)) =~ s/{{(.*?)}}/$row->{$1}/g;
-    (my $link = $alert_type->head_link) =~ s/{{(.*?)}}/$row->{$1}/g;
-    (my $desc = _($alert_type->head_description)) =~ s/{{(.*?)}}/$row->{$1}/g;
+    (my $title = _($alert_type->head_title)) =~ s/\{\{(.*?)}}/$row->{$1}/g;
+    (my $link = $alert_type->head_link) =~ s/\{\{(.*?)}}/$row->{$1}/g;
+    (my $desc = _($alert_type->head_description)) =~ s/\{\{(.*?)}}/$row->{$1}/g;
 
     $c->stash->{rss}->channel(
-        title       => ent($title),
+        title       => encode_entities($title),
         link        => $c->uri_for($link) . ($c->stash->{qs} || ''),
-        description => ent($desc),
+        description => encode_entities($desc),
         language    => 'en-gb',
     );
 }
@@ -350,7 +362,7 @@ sub get_query_parameters : Private {
     $d = '' unless $d && $d =~ /^\d+$/;
     $c->stash->{distance} = $d;
 
-    my $state = $c->req->param('state') || 'all';
+    my $state = $c->get_param('state') || 'all';
     $state = 'all' unless $state =~ /^(all|open|fixed)$/;
     $c->stash->{state_qs} = "?state=$state" unless $state eq 'all';
 
@@ -367,6 +379,20 @@ sub redirect_lat_lon : Private {
     my $state_qs = '';
     $state_qs    = $c->stash->{state_qs} if $c->stash->{state_qs};
     $c->res->redirect( "/rss/l/$lat,$lon" . $d_str . $state_qs );
+}
+
+sub xsl : Path {
+    my ($self, $c) = @_;
+
+    my @include_path = @{ $c->cobrand->path_to_email_templates($c->stash->{lang_code}) };
+    my $vars = {
+        %{ $c->stash },
+        additional_template_paths => \@include_path,
+    };
+    my $body = $c->view('Email')->render($c, 'xsl.xsl', $vars);
+
+    $c->response->header('Content-Type' => 'text/xml; charset=utf-8');
+    $c->response->body($body);
 }
 
 =head1 AUTHOR

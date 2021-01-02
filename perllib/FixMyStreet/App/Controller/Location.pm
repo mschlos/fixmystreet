@@ -6,6 +6,9 @@ BEGIN {extends 'Catalyst::Controller'; }
 
 use Encode;
 use FixMyStreet::Geocode;
+use Geo::OLC;
+use Try::Tiny;
+use Utils;
 
 =head1 NAME
 
@@ -28,15 +31,15 @@ Use latitude and longitude if provided in parameters.
 sub determine_location_from_coords : Private {
     my ( $self, $c ) = @_;
 
-    my $latitude  = $c->req->param('latitude')  || $c->req->param('lat');
-    my $longitude = $c->req->param('longitude') || $c->req->param('lon');
+    my $latitude = $c->get_param('latitude') || $c->get_param('lat');
+    my $longitude = $c->get_param('longitude') || $c->get_param('lon');
 
     if ( defined $latitude && defined $longitude ) {
-        $c->stash->{latitude}  = $latitude;
-        $c->stash->{longitude} = $longitude;
+        ($c->stash->{latitude}, $c->stash->{longitude}) =
+            map { Utils::truncate_coordinate($_) } ($latitude, $longitude);
 
         # Also save the pc if there is one
-        if ( my $pc = $c->req->param('pc') ) {
+        if ( my $pc = $c->get_param('pc') ) {
             $c->stash->{pc} = $pc;
         }
 
@@ -50,6 +53,8 @@ sub determine_location_from_coords : Private {
 
 User has searched for a location - try to find it for them.
 
+Return false if nothing provided.
+
 If one match is found returns true and lat/lng is set.
 
 If several possible matches are found puts an array onto stash so that user can be prompted to pick one and returns false.
@@ -62,18 +67,43 @@ sub determine_location_from_pc : Private {
     my ( $self, $c, $pc ) = @_;
 
     # check for something to search
-    $pc ||= $c->req->param('pc') || return;
+    $pc ||= $c->get_param('pc') || return;
     $c->stash->{pc} = $pc;    # for template
 
     if ( $pc =~ /^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/ ) {
-        $c->stash->{latitude}  = $1;
-        $c->stash->{longitude} = $2;
+        ($c->stash->{latitude}, $c->stash->{longitude}) =
+            map { Utils::truncate_coordinate($_) } ($1, $2);
         return $c->forward( 'check_location' );
     }
+
+    if (Geo::OLC::is_full($pc)) {
+        my $ref = Geo::OLC::decode($pc);
+        ($c->stash->{latitude}, $c->stash->{longitude}) =
+            map { Utils::truncate_coordinate($_) } @{$ref->{center}};
+        return $c->forward( 'check_location' );
+    }
+
+    if ($pc =~ /^\s*([2-9CFGHJMPQRVWX]{4,6}\+[2-9CFGHJMPQRVWX]{2,3})\s+(.*)$/i) {
+        my ($code, $rest) = ($1, $2);
+        my ($lat, $lon, $error) = FixMyStreet::Geocode::lookup($rest, $c);
+        if (ref($error) eq 'ARRAY') { # Just take the first result
+            $lat = $error->[0]{latitude};
+            $lon = $error->[0]{longitude};
+        }
+        if (defined $lat && defined $lon) {
+            $code = Geo::OLC::recover_nearest($code, $lat, $lon);
+            my $ref = Geo::OLC::decode($code);
+            ($c->stash->{latitude}, $c->stash->{longitude}) =
+                map { Utils::truncate_coordinate($_) } @{$ref->{center}};
+            return $c->forward( 'check_location' );
+        }
+    }
+
     if ( $c->cobrand->country eq 'GB' && $pc =~ /^([A-Z])([A-Z])([\d\s]{4,})$/i) {
         if (my $convert = gridref_to_latlon( $1, $2, $3 )) {
-            $c->stash->{latitude}  = $convert->{latitude};
-            $c->stash->{longitude} = $convert->{longitude};
+            ($c->stash->{latitude}, $c->stash->{longitude}) =
+                map { Utils::truncate_coordinate($_) }
+                ($convert->{latitude}, $convert->{longitude});
             return $c->forward( 'check_location' );
         }
     }
@@ -91,7 +121,7 @@ sub determine_location_from_pc : Private {
     # $error doubles up to return multiple choices by being an array
     if ( ref($error) eq 'ARRAY' ) {
         foreach (@$error) {
-            my $a = decode_utf8($_->{address});
+            my $a = $_->{address};
             $a =~ s/, United Kingdom//;
             $a =~ s/, UK//;
             $_->{address} = $a;
@@ -101,8 +131,43 @@ sub determine_location_from_pc : Private {
     }
 
     # pass errors back to the template
+    $c->stash->{location_error_pc_lookup} = 1;
     $c->stash->{location_error} = $error;
+
+    # Log failure in a log db
+    try {
+        my $dbfile = FixMyStreet->path_to('../data/analytics.sqlite');
+        my $db = DBI->connect("dbi:SQLite:dbname=$dbfile", undef, undef, { PrintError => 0 }) or die "$DBI::errstr\n";
+        my $sth = $db->prepare("INSERT INTO location_searches_with_no_results
+            (datetime, cobrand, geocoder, url, user_input)
+            VALUES (?, ?, ?, ?, ?)") or die $db->errstr . "\n";
+        my $rv = $sth->execute(
+            POSIX::strftime("%Y-%m-%d %H:%M:%S", localtime(time())),
+            $c->cobrand->moniker,
+            $c->cobrand->get_geocoder(),
+            $c->stash->{geocoder_url},
+            $pc,
+        );
+    } catch {
+        $c->log->debug("Unable to log to analytics.sqlite: $_");
+    };
+
     return;
+}
+
+sub determine_location_from_bbox : Private {
+    my ( $self, $c ) = @_;
+
+    my $bbox = $c->get_param('bbox');
+    return unless $bbox;
+
+    my ($min_lon, $min_lat, $max_lon, $max_lat) = split /,/, $bbox;
+    my $longitude = ($max_lon + $min_lon ) / 2;
+    my $latitude = ($max_lat + $min_lat ) / 2;
+    $c->stash->{bbox} = $bbox;
+    $c->stash->{latitude} = $latitude;
+    $c->stash->{longitude} = $longitude;
+    return $c->forward('check_location');
 }
 
 =head2 check_location

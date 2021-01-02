@@ -2,6 +2,8 @@ package FixMyStreet::App::Controller::Council;
 use Moose;
 use namespace::autoclean;
 
+use FixMyStreet::MapIt;
+
 BEGIN {extends 'Catalyst::Controller'; }
 
 =head1 NAME
@@ -36,7 +38,7 @@ there are no areas then return false.
 =cut
 
 sub load_and_check_areas : Private {
-    my ( $self, $c ) = @_;
+    my ( $self, $c, $prefetched_all_areas ) = @_;
 
     my $latitude  = $c->stash->{latitude};
     my $longitude = $c->stash->{longitude};
@@ -49,14 +51,25 @@ sub load_and_check_areas : Private {
         $area_types = $c->cobrand->area_types;
     }
 
-    my $short_latitude  = Utils::truncate_coordinate($latitude);
-    my $short_longitude = Utils::truncate_coordinate($longitude);
+    # Cobrand may wish to add area types to look up for a point at runtime.
+    # This can be used for, e.g., parish councils on a particular council
+    # cobrand. NB three-tier councils break the alerts pages, so don't run the
+    # hook if we're on an alerts page.
+    unless ($c->stash->{area_check_action} eq 'alert') {
+        $area_types = $c->cobrand->call_hook("add_extra_area_types" => $area_types) || $area_types;
+    }
 
     my $all_areas;
-    if ( $c->stash->{fetch_all_areas} ) {
+
+    if ($prefetched_all_areas) {
+        $all_areas = {
+            map { $_ => { id => $_ } }
+            @$prefetched_all_areas
+        };
+    } elsif ( $c->stash->{fetch_all_areas} ) {
         my %area_types = map { $_ => 1 } @$area_types;
         $all_areas =
-          mySociety::MaPit::call( 'point', "4326/$short_longitude,$short_latitude" );
+          FixMyStreet::MapIt::call('point', "4326/$longitude,$latitude");
         $c->stash->{all_areas_mapit} = $all_areas;
         $all_areas = {
             map { $_ => $all_areas->{$_} }
@@ -65,10 +78,10 @@ sub load_and_check_areas : Private {
         };
     } else {
         $all_areas =
-          mySociety::MaPit::call( 'point', "4326/$short_longitude,$short_latitude",
-            type => $area_types );
+          FixMyStreet::MapIt::call('point', "4326/$longitude,$latitude", type => $area_types);
     }
     if ($all_areas->{error}) {
+        $c->stash->{location_error_mapit_error} = 1;
         $c->stash->{location_error} = $all_areas->{error};
         return;
     }
@@ -78,6 +91,7 @@ sub load_and_check_areas : Private {
       $c->cobrand->area_check( { all_areas => $all_areas },
         $c->stash->{area_check_action} );
     if ( !$success ) {
+        $c->stash->{location_error_cobrand_check} = 1;
         $c->stash->{location_error} = $error_msg;
         return;
     }
@@ -87,6 +101,7 @@ sub load_and_check_areas : Private {
 
     # If we don't have any areas we can't accept the report
     if ( !scalar keys %$all_areas ) {
+        $c->stash->{location_error_no_areas} = 1;
         $c->stash->{location_error} = _('That location does not appear to be covered by a council; perhaps it is offshore or outside the country. Please try again.');
         return;
     }

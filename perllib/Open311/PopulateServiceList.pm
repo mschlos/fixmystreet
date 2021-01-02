@@ -1,20 +1,21 @@
 package Open311::PopulateServiceList;
 
-use Moose;
-use LWP::Simple;
-use XML::Simple;
-use FixMyStreet::App;
+use Moo;
+use File::Basename;
 use Open311;
 
 has bodies => ( is => 'ro' );
 has found_contacts => ( is => 'rw', default => sub { [] } );
 has verbose => ( is => 'ro', default => 0 );
+has schema => ( is => 'ro', lazy => 1, default => sub { FixMyStreet::DB->schema->connect } );
 
-has _current_body => ( is => 'rw' );
+has _current_body => ( is => 'rw', trigger => sub {
+    my ($self, $body) = @_;
+    $self->_current_body_cobrand($body->get_cobrand_handler);
+} );
+has _current_body_cobrand => ( is => 'rw' );
 has _current_open311 => ( is => 'rw' );
 has _current_service => ( is => 'rw' );
-
-my $bodies = FixMyStreet::App->model('DB::Body');
 
 sub process_bodies {
     my $self = shift;
@@ -22,7 +23,6 @@ sub process_bodies {
     while ( my $body = $self->bodies->next ) {
         next unless $body->endpoint;
         next unless lc($body->send_method) eq 'open311';
-        next if $body->jurisdiction =~ /^fixmybarangay_\w+$/; # FMB depts. not using service discovery yet
         $self->_current_body( $body );
         $self->process_body;
     }
@@ -40,11 +40,14 @@ sub process_body {
     $self->_check_endpoints;
 
     my $list = $open311->get_service_list;
-    unless ( $list ) {
-        my $id = $self->_current_body->id;
-        my $areas = join( ",", keys %{$self->_current_body->areas} );
-        warn "Body $id for areas $areas - http://mapit.mysociety.org/areas/$areas.html - did not return a service list\n"
-            if $self->verbose >= 1;
+    unless ( $list && $list->{service} ) {
+        if ($self->verbose >= 1) {
+            my $id = $self->_current_body->id;
+            my $mapit_url = FixMyStreet->config('MAPIT_URL');
+            my $areas = join( ",", keys %{$self->_current_body->areas} );
+            warn "Body $id for areas $areas - $mapit_url/areas/$areas.html - did not return a service list\n";
+            warn $open311->error;
+        }
         return;
     }
     $self->process_services( $list );
@@ -72,7 +75,8 @@ sub process_services {
     my $list = shift;
 
     $self->found_contacts( [] );
-    foreach my $service ( @{ $list->{service} } ) {
+    my $services = $list->{service};
+    foreach my $service ( @$services ) {
         $self->_current_service( $service );
         $self->process_service;
     }
@@ -82,17 +86,21 @@ sub process_services {
 sub process_service {
     my $self = shift;
 
-    my $category = $self->_current_body->areas->{2218} ?
-                    $self->_current_service->{description} :
-                    $self->_current_service->{service_name};
+    my $service_name = $self->_normalize_service_name;
 
-    print $self->_current_service->{service_code} . ': ' . $category .  "\n" if $self->verbose >= 2;
-    my $contacts = FixMyStreet::App->model( 'DB::Contact')->search(
+    unless (defined $self->_current_service->{service_code}) {
+        warn "Service $service_name has no service code for body @{[$self->_current_body->id]}\n"
+            if $self->verbose >= 1;
+        return;
+    }
+
+    print $self->_current_service->{service_code} . ': ' . $service_name .  "\n" if $self->verbose >= 2;
+    my $contacts = $self->schema->resultset('Contact')->search(
         {
             body_id => $self->_current_body->id,
             -OR => [
                 email => $self->_current_service->{service_code},
-                category => $category,
+                category => $service_name,
             ]
         }
     );
@@ -101,7 +109,7 @@ sub process_service {
         printf(
             "Multiple contacts for service code %s, category %s - Skipping\n",
             $self->_current_service->{service_code},
-            $category,
+            $service_name,
         );
 
         # best to not mark them as deleted as we don't know what we're doing
@@ -121,24 +129,34 @@ sub process_service {
     }
 }
 
+sub _action_params {
+    my ( $self, $action ) = @_;
+
+    return {
+        editor => basename($0),
+        whenedited => \'current_timestamp',
+        note => "$action automatically by script",
+    };
+}
+
 sub _handle_existing_contact {
     my ( $self, $contact ) = @_;
 
     my $service_name = $self->_normalize_service_name;
+    my $protected = $contact->get_extra_metadata("open311_protect");
+
+    return if $self->_current_body_cobrand && $self->_current_body_cobrand->call_hook(open311_skip_existing_contact => $contact);
 
     print $self->_current_body->id . " already has a contact for service code " . $self->_current_service->{service_code} . "\n" if $self->verbose >= 2;
 
-    if ( $contact->deleted || $service_name ne $contact->category || $self->_current_service->{service_code} ne $contact->email ) {
+    if ( $contact->state eq 'deleted' || $service_name ne $contact->category || $self->_current_service->{service_code} ne $contact->email ) {
         eval {
             $contact->update(
                 {
-                    category => $service_name,
+                    $protected ? () : (category => $service_name),
                     email => $self->_current_service->{service_code},
-                    confirmed => 1,
-                    deleted => 0,
-                    editor => $0,
-                    whenedited => \'ms_current_timestamp()',
-                    note => 'automatically undeleted by script',
+                    state => 'confirmed',
+                    %{ $self->_action_params("undeleted") },
                 }
             );
         };
@@ -150,11 +168,21 @@ sub _handle_existing_contact {
         }
     }
 
-    if ( $contact and lc( $self->_current_service->{metadata} ) eq 'true' ) {
+    my $metadata = $self->_current_service->{metadata} || '';
+    if ( $contact and lc($metadata) eq 'true' ) {
         $self->_add_meta_to_contact( $contact );
-    } elsif ( $contact and $contact->extra and lc( $self->_current_service->{metadata} ) eq 'false' ) {
-        $contact->update( { extra => undef } );
+    } elsif ( $contact and $contact->extra and lc($metadata) eq 'false' ) {
+        # check if there are any protected fields that we should not delete
+        my @meta = (
+            grep { ($_->{protected} || '') eq 'true' }
+            @{ $contact->get_extra_fields }
+        );
+        $contact->set_extra_fields(@meta);
+        $contact->update;
     }
+
+    $self->_set_contact_group($contact) unless $protected;
+    $self->_set_contact_non_public($contact);
 
     push @{ $self->found_contacts }, $self->_current_service->{service_code};
 }
@@ -166,16 +194,13 @@ sub _create_contact {
 
     my $contact;
     eval {
-        $contact = FixMyStreet::App->model( 'DB::Contact')->create(
+        $contact = $self->schema->resultset('Contact')->create(
             {
                 email => $self->_current_service->{service_code},
                 body_id => $self->_current_body->id,
                 category => $service_name,
-                confirmed => 1,
-                deleted => 0,
-                editor => $0,
-                whenedited => \'ms_current_timestamp()',
-                note => 'created automatically by script',
+                state => 'confirmed',
+                %{ $self->_action_params("created") },
             }
         );
     };
@@ -186,9 +211,13 @@ sub _create_contact {
         return;
     }
 
-    if ( $contact and lc( $self->_current_service->{metadata} ) eq 'true' ) {
+    my $metadata = $self->_current_service->{metadata} || '';
+    if ( $contact and lc($metadata) eq 'true' ) {
         $self->_add_meta_to_contact( $contact );
     }
+
+    $self->_set_contact_group($contact);
+    $self->_set_contact_non_public($contact);
 
     if ( $contact ) {
         push @{ $self->found_contacts }, $self->_current_service->{service_code};
@@ -199,56 +228,53 @@ sub _create_contact {
 sub _add_meta_to_contact {
     my ( $self, $contact ) = @_;
 
-    print "Fetching meta data for $self->_current_service->{service_code}\n" if $self->verbose >= 2;
+    print "Fetching meta data for " . $self->_current_service->{service_code} . "\n" if $self->verbose >= 2;
     my $meta_data = $self->_current_open311->get_service_meta_info( $self->_current_service->{service_code} );
 
-    if ( ref $meta_data->{ attributes }->{ attribute } eq 'HASH' ) {
-        $meta_data->{ attributes }->{ attribute } = [
-            $meta_data->{ attributes }->{ attribute }
-        ];
-    }
-
-    if ( ! $meta_data->{attributes}->{attribute} ) {
+    unless (ref $meta_data->{attributes} eq 'ARRAY') {
         warn sprintf( "Empty meta data for %s at %s",
                       $self->_current_service->{service_code},
                       $self->_current_body->endpoint )
-        if $self->verbose;
+        # Bristol has a habit of returning empty metadata, stop noise from that.
+        if $self->verbose and $self->_current_body->name ne 'Bristol City Council';
         return;
     }
 
-    # turn the data into something a bit more friendly to use
+    # check if there are any protected fields that we should not overwrite
+    my $protected = {
+        map { $_->{code} => $_ }
+        grep { ($_->{protected} || '') eq 'true' }
+        @{ $contact->get_extra_fields }
+    };
     my @meta =
+        map { $protected->{$_->{code}} ? delete $protected->{$_->{code}} : $_ }
+        @{ $meta_data->{attributes} };
+
+    # and then add back in any protected fields that we don't fetch
+    push @meta, values %$protected;
+
+    # turn the data into something a bit more friendly to use
+    @meta =
         # remove trailing colon as we add this when we display so we don't want 2
-        map { $_->{description} =~ s/:\s*//; $_ }
+        map {
+            if ($_->{description}) {
+                $_->{description} =~ s/:\s*$//;
+                $_->{description} = FixMyStreet::Template::sanitize($_->{description});
+            }
+            $_
+        }
         # there is a display order and we only want to sort once
-        sort { $a->{order} <=> $b->{order} }
-        @{ $meta_data->{attributes}->{attribute} };
+        sort { ($a->{order} || 0) <=> ($b->{order} || 0) }
+        @meta;
 
-    # we add these later on from bromley so don't list them here
-    # as we don't want to display them
-    if ( $self->_current_body->areas->{2482} ) {
-        my %ignore = map { $_ => 1 } qw/
-            service_request_id_ext
-            requested_datetime
-            report_url
-            title
-            last_name
-            email
-            easting
-            northing
-            report_title
-            public_anonymity_required
-            email_alerts_requested
-        /;
+    # Some Open311 endpoints, such as Bromley and Warwickshire send <metadata>
+    # for attributes which we *don't* want to display to the user (e.g. as
+    # fields in "category_extras"), or need additional attributes adding not
+    # returned by the server for whatever reason.
+    $self->_current_body_cobrand && $self->_current_body_cobrand->call_hook(
+        open311_contact_meta_override => $self->_current_service, $contact, \@meta);
 
-        @meta = grep { ! $ignore{ $_->{ code } } } @meta;
-    }
-
-    if ( @meta ) {
-        $contact->extra( \@meta );
-    } else {
-        $contact->extra( undef );
-    }
+    $contact->set_extra_fields(@meta);
     $contact->update;
 }
 
@@ -267,25 +293,90 @@ sub _normalize_service_name {
     return $service_name;
 }
 
+sub _set_contact_group {
+    my ($self, $contact) = @_;
+
+    my $old_group = $contact->groups;
+    my $new_group = $self->_get_new_groups;
+
+    if ($self->_groups_different($old_group, $new_group)) {
+        if (@$new_group) {
+            $contact->set_extra_metadata(group => @$new_group == 1 ? $new_group->[0] : $new_group);
+            $contact->update( $self->_action_params("group updated") );
+        } else {
+            $contact->unset_extra_metadata('group');
+            $contact->update( $self->_action_params("group removed") );
+        }
+    }
+}
+
+sub _set_contact_non_public {
+    my ($self, $contact) = @_;
+
+    # We never want to make a private category unprivate.
+    return if $contact->non_public;
+
+    my %keywords = map { $_ => 1 } split /,/, ( $self->_current_service->{keywords} || '' );
+    $contact->update({
+        non_public => 1,
+        %{ $self->_action_params("marked private") },
+    }) if $keywords{private};
+}
+
+sub _get_new_groups {
+    my $self = shift;
+    return [] unless $self->_current_body_cobrand && $self->_current_body_cobrand->enable_category_groups;
+
+    my $groups = $self->_current_service->{groups} || [];
+    return $groups if @$groups;
+
+    my $group = $self->_current_service->{group} || [];
+    $group = [] if @$group == 1 && !$group->[0]; # <group></group> becomes [undef]...
+    return $group;
+}
+
+sub _groups_different {
+    my ($self, $old, $new) = @_;
+
+    return join( ',', sort(@$old) ) ne join( ',', sort(@$new) );
+}
+
 sub _delete_contacts_not_in_service_list {
     my $self = shift;
 
-    my $found_contacts = FixMyStreet::App->model( 'DB::Contact')->search(
+    my $found_contacts = $self->schema->resultset('Contact')->not_deleted->search(
         {
             email => { -not_in => $self->found_contacts },
             body_id => $self->_current_body->id,
-            deleted => 0,
         }
     );
 
+    if ($self->_current_body->can_be_devolved) {
+        # If the body has can_be_devolved switched on, ignore any
+        # contact with its own send method
+        $found_contacts = $found_contacts->search(
+            { send_method => [ "", undef ] },
+        );
+    }
+
+    $found_contacts = $self->_delete_contacts_not_in_service_list_cobrand_overrides($found_contacts);
+
     $found_contacts->update(
         {
-            deleted => 1,
-            editor  => $0,
-            whenedited => \'ms_current_timestamp()',
-            note => 'automatically marked as deleted by script'
+            state => 'deleted',
+            %{ $self->_action_params("marked as deleted") },
         }
     );
+}
+
+sub _delete_contacts_not_in_service_list_cobrand_overrides {
+    my ( $self, $found_contacts ) = @_;
+
+    if ($self->_current_body_cobrand && $self->_current_body_cobrand->can('open311_filter_contacts_for_deletion')) {
+        return $self->_current_body_cobrand->open311_filter_contacts_for_deletion($found_contacts);
+    } else {
+        return $found_contacts;
+    }
 }
 
 1;

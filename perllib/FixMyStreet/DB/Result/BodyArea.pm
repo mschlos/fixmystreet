@@ -8,7 +8,11 @@ use strict;
 use warnings;
 
 use base 'DBIx::Class::Core';
-__PACKAGE__->load_components("FilterColumn", "InflateColumn::DateTime", "EncodedColumn");
+__PACKAGE__->load_components(
+  "FilterColumn",
+  "FixMyStreet::InflateColumn::DateTime",
+  "FixMyStreet::EncodedColumn",
+);
 __PACKAGE__->table("body_areas");
 __PACKAGE__->add_columns(
   "body_id",
@@ -21,12 +25,12 @@ __PACKAGE__->belongs_to(
   "body",
   "FixMyStreet::DB::Result::Body",
   { id => "body_id" },
-  { is_deferrable => 1, on_delete => "CASCADE", on_update => "CASCADE" },
+  { is_deferrable => 0, on_delete => "NO ACTION", on_update => "NO ACTION" },
 );
 
 
-# Created by DBIx::Class::Schema::Loader v0.07017 @ 2012-12-19 12:47:10
-# DO NOT MODIFY THIS OR ANYTHING ABOVE! md5sum:aAr+Nadyu8IckZlK6+PTNg
+# Created by DBIx::Class::Schema::Loader v0.07035 @ 2019-04-25 12:06:39
+# DO NOT MODIFY THIS OR ANYTHING ABOVE! md5sum:VPs3e9McGNO+Dd7C4pApxw
 
  __PACKAGE__->set_primary_key(__PACKAGE__->columns);
 

@@ -1,27 +1,25 @@
 use strict;
 use warnings;
+use utf8;
 
 use Test::More;
 
-use FixMyStreet;
-use mySociety::Locale;
-use Encode;
-use Data::Dumper;
 use HTTP::Headers;
 use Sort::Key qw(keysort);
 use POSIX 'strcoll';
-local $Data::Dumper::Sortkeys = 1;
-use utf8;
+
+use FixMyStreet;
+use mySociety::Locale;
 
 # check that the mo files have been generated
 die "You need to run 'commonlib/bin/gettext-makemo --quiet FixMyStreet' "
   . "to generate the *.mo files needed."
   unless -e FixMyStreet->path_to(
-    'locale/cy_GB.UTF-8/LC_MESSAGES/FixMyStreet-EmptyHomes.mo');
+    'locale/sv_SE.UTF-8/LC_MESSAGES/FixMyStreet.mo');
 
 # Test the language negotiation works
 my $lang = mySociety::Locale::negotiate_language(
-    'en-gb,English,en_GB|cy,Cymraeg,cy_GB|es,Spanish,es_ES',
+    'en-gb,English,en_GB|es,Spanish,es_ES',
     undef,
     HTTP::Headers->new(
         Accept_Language => 'es,en-gb;q=0.6,en;q=0.4'
@@ -31,42 +29,37 @@ is $lang, 'es', 'Language negotiation works okay';
 
 # Example strings
 my $english = "Please enter a valid email";
-my $welsh   = "Cofnodwch gyfeiriad e-bost dilys";
+my $swedish = "Skriv in en giltig epostadress";
 
 # set english as the language
 mySociety::Locale::negotiate_language(    #
-    'en-gb,English,en_GB|cy,Cymraeg,cy_GB', 'en_GB'
+    'en-gb,English,en_GB|sv,Swedish,sv_SE', 'en_GB'
 );
 
-mySociety::Locale::gettext_domain( 'FixMyStreet-EmptyHomes', 1 );
+mySociety::Locale::gettext_domain( 'FixMyStreet', 1 );
 mySociety::Locale::change();
 is _($english), $english, "english to english";
 
-# set to welsh and check for translation
-mySociety::Locale::change('cy');
-is _($english), $welsh, "english to welsh";
+mySociety::Locale::change('sv');
+is _($english), $swedish, "english to Swedish";
 
 # check that being in a deep directory does not confuse the code
 chdir FixMyStreet->path_to('t/app/controller') . '';
-mySociety::Locale::gettext_domain( 'FixMyStreet-EmptyHomes', 1,
+mySociety::Locale::gettext_domain( 'FixMyStreet', 1,
     FixMyStreet->path_to('locale')->stringify );
-mySociety::Locale::change('cy');
-is _($english), $welsh, "english to welsh (deep directory)";
+mySociety::Locale::change('sv');
+is _($english), $swedish, "english to Swedish (deep directory)";
 
 # test that sorting works as expected in the right circumstances...
-my @random_sorted  = qw( Å Z Ø A );
-my @EN_sorted      = qw( A Å Ø Z );
-my @NO_sorted      = qw( A Z Ø Å );
-my @default_sorted = qw( A Z Å Ø );
+my @random_sorted  = qw( Å Z Ö A );
+my @EN_sorted      = qw( A Å Ö Z );
+my @SV_sorted      = qw( A Z Å Ö );
+my @default_sorted = qw( A Z Å Ö );
 
-sub utf8_diag {
-    diag encode_utf8( Dumper(@_) );
-}
-
-{
+SKIP: {
 
     mySociety::Locale::negotiate_language(    #
-        'en-gb,English,en_GB|cy,Cymraeg,cy_GB', 'en_GB'
+        'en-gb,English,en_GB', 'en_GB'
     );
     mySociety::Locale::change();
 
@@ -78,14 +71,18 @@ sub utf8_diag {
     is_deeply( [ keysort { $_ } @random_sorted ],
         \@default_sorted, "keysort correctly with no locale" );
 
+    skip 'Will not pass on Mac', 1 if $^O eq 'darwin';
+
     # Note - this obeys the locale
     is_deeply( [ sort { strcoll( $a, $b ) } @random_sorted ],
         \@EN_sorted, "sort strcoll correctly with no locale (to 'en_GB')" );
 }
 
-{
+SKIP: {
+    skip 'Will not pass on Mac', 2 if $^O eq 'darwin';
+
     mySociety::Locale::negotiate_language(    #
-        'en-gb,English,en_GB|cy,Cymraeg,cy_GB', 'en_GB'
+        'en-gb,English,en_GB', 'en_GB'
     );
     mySociety::Locale::change();
     use locale;
@@ -100,21 +97,21 @@ sub utf8_diag {
         \@EN_sorted, "sort strcoll correctly with use locale 'en_GB'" );
 }
 
-{
+SKIP: {
     mySociety::Locale::negotiate_language(    #
-        'nb-no,Norwegian,nb_NO', 'nb_NO'
+        'sv,Swedish,sv_SE', 'sv_SE'
     );
     mySociety::Locale::change();
     use locale;
 
     is_deeply( [ sort @random_sorted ],
-        \@NO_sorted, "sort correctly with use locale 'nb_NO'" );
+        \@SV_sorted, "sort correctly with use locale 'sv_SE'" );
 
     # is_deeply( [ keysort { $_ } @random_sorted ],
-    #     \@NO_sorted, "keysort correctly with use locale 'nb_NO'" );
+    #     \@SV_sorted, "keysort correctly with use locale 'sv_SE'" );
 
     is_deeply( [ sort { strcoll( $a, $b ) } @random_sorted ],
-        \@NO_sorted, "sort strcoll correctly with use locale 'nb_NO'" );
+        \@SV_sorted, "sort strcoll correctly with use locale 'sv_SE'" );
 }
 
 subtest "check that code is only called once by in_gb_locale" => sub {

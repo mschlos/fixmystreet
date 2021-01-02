@@ -1,17 +1,6 @@
-#!/usr/bin/env perl
+#!/bin/bash
+#
+# Wrapper to call new script
 
-use strict;
-use warnings;
-require 5.8.0;
-
-use FixMyStreet::App;
-use CronFns;
-my ($verbose, $nomail) = CronFns::options();
-
-use Open311;
-use Open311::GetServiceRequestUpdates;
-
-
-my $updates = Open311::GetServiceRequestUpdates->new( verbose => $verbose );
-
-$updates->fetch;
+DIR="$(cd "$(dirname "$BASH_SOURCE")" && pwd -P)"
+$DIR/fetch --updates

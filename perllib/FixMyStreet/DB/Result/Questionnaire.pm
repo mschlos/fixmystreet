@@ -8,7 +8,11 @@ use strict;
 use warnings;
 
 use base 'DBIx::Class::Core';
-__PACKAGE__->load_components("FilterColumn", "InflateColumn::DateTime", "EncodedColumn");
+__PACKAGE__->load_components(
+  "FilterColumn",
+  "FixMyStreet::InflateColumn::DateTime",
+  "FixMyStreet::EncodedColumn",
+);
 __PACKAGE__->table("questionnaire");
 __PACKAGE__->add_columns(
   "id",
@@ -36,31 +40,21 @@ __PACKAGE__->belongs_to(
   "problem",
   "FixMyStreet::DB::Result::Problem",
   { id => "problem_id" },
-  { is_deferrable => 1, on_delete => "CASCADE", on_update => "CASCADE" },
+  { is_deferrable => 0, on_delete => "NO ACTION", on_update => "NO ACTION" },
 );
 
 
-# Created by DBIx::Class::Schema::Loader v0.07017 @ 2012-03-08 17:19:55
-# DO NOT MODIFY THIS OR ANYTHING ABOVE! md5sum:NGlSRjoBpDoIvK3EueqN6Q
+# Created by DBIx::Class::Schema::Loader v0.07035 @ 2019-04-25 12:06:39
+# DO NOT MODIFY THIS OR ANYTHING ABOVE! md5sum:AWRb6itjsVkG5VUDRmBTIg
 
-use DateTime::TimeZone;
+use Moo;
+use namespace::clean -except => [ 'meta' ];
 
-my $tz = DateTime::TimeZone->new( name => "local" );
-
-sub whensent_local {
+sub marks_fixed {
     my $self = shift;
-
-    return $self->whensent
-      ? $self->whensent->set_time_zone($tz)
-      : $self->whensent;
-}
-
-sub whenanswered_local {
-    my $self = shift;
-
-    return $self->whenanswered
-      ? $self->whenanswered->set_time_zone($tz)
-      : $self->whenanswered;
+    my $new_fixed = FixMyStreet::DB::Result::Problem->fixed_states()->{$self->new_state};
+    my $old_fixed = FixMyStreet::DB::Result::Problem->fixed_states()->{$self->old_state};
+    return $new_fixed && !$old_fixed;
 }
 
 1;

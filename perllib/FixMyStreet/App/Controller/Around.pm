@@ -5,10 +5,11 @@ use namespace::autoclean;
 BEGIN { extends 'Catalyst::Controller'; }
 
 use FixMyStreet::Map;
-use List::MoreUtils qw(any);
 use Encode;
-use FixMyStreet::Map;
+use JSON::MaybeXS;
 use Utils;
+use Try::Tiny;
+use Text::CSV;
 
 =head1 NAME
 
@@ -30,8 +31,17 @@ If no search redirect back to the homepage.
 
 =cut
 
-sub around_index : Path : Args(0) {
+sub index : Path : Args(0) {
     my ( $self, $c ) = @_;
+
+    if ($c->get_param('ajax')) {
+        $c->detach('ajax');
+    }
+
+    # Check if the user is searching for a report by ID
+    if ( $c->get_param('pc') && $c->get_param('pc') =~ $c->cobrand->lookup_by_ref_regex ) {
+        $c->go('lookup_by_ref', [ $1 ]);
+    }
 
     # handle old coord systems
     $c->forward('redirect_en_or_xy_to_latlon');
@@ -40,25 +50,36 @@ sub around_index : Path : Args(0) {
     my $partial_report = $c->forward('load_partial');
 
     # Try to create a location for whatever we have
-    return
-      unless $c->forward('/location/determine_location_from_coords')
-          || $c->forward('/location/determine_location_from_pc');
+    my $ret = $c->forward('/location/determine_location_from_bbox')
+        || $c->forward('/location/determine_location_from_coords')
+        || $c->forward('/location/determine_location_from_pc');
+    unless ($ret) {
+        return $c->res->redirect('/') unless $c->get_param('pc') || $partial_report;
+        # Cobrand may want to perform custom searching at this point,
+        # e.g. presenting a list of reports matching the user's query.
+        $c->cobrand->call_hook("around_custom_search");
+        return;
+    }
 
     # Check to see if the spot is covered by a area - if not show an error.
-    return unless $c->cobrand->moniker eq 'fixmybarangay' || $c->forward('check_location_is_acceptable');
+    return unless $c->forward('check_location_is_acceptable', []);
 
-    # If we have a partial - redirect to /report/new so that it can be
-    # completed.
-    if ($partial_report) {
-        my $new_uri = $c->uri_for(
-            '/report/new',
-            {
-                partial   => $c->stash->{partial_token}->token,
-                latitude  => $c->stash->{latitude},
-                longitude => $c->stash->{longitude},
-                pc        => $c->stash->{pc},
-            }
-        );
+    # Redirect to /report/new in two cases:
+    #  - if we have a partial report, so that it can be completed.
+    #  - if the cobrand doesn't show anything on /around (e.g. a private
+    #    reporting site)
+    if ($partial_report || $c->cobrand->call_hook("skip_around_page")) {
+        my $params = {
+            latitude  => $c->stash->{latitude},
+            longitude => $c->stash->{longitude},
+            pc        => $c->stash->{pc}
+        };
+        if ($partial_report) {
+            $params->{partial} = $c->stash->{partial_token}->token;
+        } elsif ($c->get_param("category")) {
+            $params->{category} = $c->get_param("category");
+        }
+        my $new_uri = $c->uri_for('/report/new', $params);
         return $c->res->redirect($new_uri);
     }
 
@@ -77,13 +98,12 @@ Handle coord systems that are no longer in use.
 
 sub redirect_en_or_xy_to_latlon : Private {
     my ( $self, $c ) = @_;
-    my $req = $c->req;
 
     # check for x,y or e,n requests
-    my $x = $req->param('x');
-    my $y = $req->param('y');
-    my $e = $req->param('e');
-    my $n = $req->param('n');
+    my $x = $c->get_param('x');
+    my $y = $c->get_param('y');
+    my $e = $c->get_param('e');
+    my $n = $c->get_param('n');
 
     # lat and lon - fill in below if we need to
     my ( $lat, $lon );
@@ -117,7 +137,7 @@ token to stash and return report. Otherwise return false.
 sub load_partial : Private {
     my ( $self, $c ) = @_;
 
-    my $partial = scalar $c->req->param('partial')
+    my $partial = $c->get_param('partial')
       || return;
 
     # is it in the database
@@ -155,55 +175,26 @@ sub display_location : Private {
     # set the template to use
     $c->stash->{template} = 'around/display_location.html';
 
-    # get the lat,lng
+    $c->forward('/auth/get_csrf_token');
+
+    # Check the category to filter by, if any, is valid
+    $c->forward('check_and_stash_category');
+
     my $latitude  = $c->stash->{latitude};
     my $longitude = $c->stash->{longitude};
 
-    # truncate the lat,lon for nicer rss urls, and strings for outputting
-    my $short_latitude  = Utils::truncate_coordinate($latitude);
-    my $short_longitude = Utils::truncate_coordinate($longitude);
-    $c->stash->{short_latitude}  = $short_latitude;
-    $c->stash->{short_longitude} = $short_longitude;
-
-    # Deal with pin hiding/age
-    my $all_pins = $c->req->param('all_pins') ? 1 : undef;
-    $c->stash->{all_pins} = $all_pins;
-    my $interval = $all_pins ? undef : $c->cobrand->on_map_default_max_pin_age;
-
-    # get the map features
-    my ( $on_map_all, $on_map, $around_map, $distance ) =
-      FixMyStreet::Map::map_features( $c, $short_latitude, $short_longitude,
-        $interval );
-
-    # copy the found reports to the stash
-    $c->stash->{on_map}     = $on_map;
-    $c->stash->{around_map} = $around_map;
-    $c->stash->{distance}   = $distance;
-
-    # create a list of all the pins
-    my @pins;
-    unless ($c->req->param('no_pins') || $c->cobrand->moniker eq 'emptyhomes') {
-        @pins = map {
-            # Here we might have a DB::Problem or a DB::Nearby, we always want the problem.
-            my $p = (ref $_ eq 'FixMyStreet::App::Model::DB::Nearby') ? $_->problem : $_;
-            my $colour = $c->cobrand->pin_colour( $p, 'around' );
-            {
-                latitude  => $p->latitude,
-                longitude => $p->longitude,
-                colour    => $colour,
-                id        => $p->id,
-                title     => $p->title_safe,
-            }
-        } @$on_map_all, @$around_map;
+    if (my $bbox = $c->stash->{bbox}) {
+        $c->forward('map_features', [ { bbox => $bbox } ]);
+    } else {
+        $c->forward('map_features', [ { latitude => $latitude, longitude => $longitude } ]);
     }
 
-    $c->stash->{page} = 'around'; # So the map knows to make clickable pins, update on pan
     FixMyStreet::Map::display_map(
         $c,
-        latitude  => $short_latitude,
-        longitude => $short_longitude,
+        latitude  => $latitude,
+        longitude => $longitude,
         clickable => 1,
-        pins      => \@pins,
+        pins      => $c->stash->{pins},
         area      => $c->cobrand->areas_on_around,
     );
 
@@ -226,66 +217,157 @@ sub check_location_is_acceptable : Private {
     return $c->forward('/council/load_and_check_areas');
 }
 
-=head2 /ajax
+=head2 check_and_stash_category
+
+Check that the 'filter_category' query param is valid, if it's present. Stores
+the validated string in the stash as filter_category.
+Puts all the valid categories in filter_categories on the stash.
+
+=cut
+
+sub check_and_stash_category : Private {
+    my ( $self, $c ) = @_;
+
+    my $all_areas = $c->stash->{all_areas};
+    my @bodies = $c->model('DB::Body')->active->for_areas(keys %$all_areas)->all;
+    my %bodies = map { $_->id => $_ } @bodies;
+    $c->cobrand->call_hook(munge_report_new_bodies => \%bodies); # To match setup_categories_and_bodies in New.pm
+
+    my @list_of_names = map { $_->name } values %bodies;
+    my $csv = Text::CSV->new();
+    $csv->combine(@list_of_names);
+    $c->stash->{around_bodies} = \@bodies;
+    $c->stash->{bodies_ids} = [ map { $_->id } @bodies];
+    $c->{stash}->{list_of_names_as_string} = $csv->string;
+
+    my $where = { body_id => [ keys %bodies ], };
+    $c->cobrand->call_hook('munge_around_category_where', $where);
+
+    my @categories = $c->model('DB::Contact')->not_deleted->search(
+        $where,
+        {
+            columns => [ 'category', 'extra' ],
+            distinct => 1
+        }
+    )->all_sorted;
+    # Ensure only uniquely named categories are shown
+    my %seen;
+    @categories = grep { !$seen{$_->category_display}++ } @categories;
+    $c->stash->{filter_categories} = \@categories;
+    my %categories_mapped = map { $_->category => 1 } @categories;
+    $c->forward('/report/stash_category_groups', [ \@categories ]) if $c->cobrand->enable_category_groups;
+
+    my $categories = [ $c->get_param_list('filter_category', 1) ];
+    my %valid_categories = map { $_ => 1 } grep { $_ && $categories_mapped{$_} } @$categories;
+    $c->stash->{filter_category} = \%valid_categories;
+    $c->cobrand->call_hook('munge_around_filter_category_list');
+
+    $c->forward('/report/assigned_users_only', [ \@categories ]);
+}
+
+sub map_features : Private {
+    my ($self, $c, $extra) = @_;
+
+    $c->stash->{page} = 'around'; # Needed by _item.html / so the map knows to make clickable pins, update on pan
+    $c->stash->{num_old_reports} = 0;
+
+    $c->forward( '/reports/stash_report_filter_status' );
+    $c->forward( '/reports/stash_report_sort', [ 'created-desc' ]);
+    $c->stash->{show_old_reports} = $c->get_param('show_old_reports');
+
+    return if $c->get_param('js'); # JS will request the same (or more) data client side
+
+    # Allow the cobrand to add in any additional query parameters
+    my $extra_params = $c->cobrand->call_hook('display_location_extra_params');
+
+    my ( $on_map, $nearby ) =
+      FixMyStreet::Map::map_features(
+        $c, %$extra,
+        categories => [ keys %{$c->stash->{filter_category}} ],
+        states => $c->stash->{filter_problem_states},
+        order => $c->stash->{sort_order},
+        extra => $extra_params,
+      );
+
+    my @pins;
+    unless ($c->get_param('no_pins')) {
+        @pins = map {
+            # Here we might have a DB::Problem or a DB::Result::Nearby, we always want the problem.
+            my $p = (ref $_ eq 'FixMyStreet::DB::Result::Nearby') ? $_->problem : $_;
+            $p->pin_data('around');
+        } @$on_map, @$nearby;
+    }
+
+    $c->stash->{pins} = \@pins;
+    $c->stash->{on_map} = $on_map;
+    $c->stash->{around_map} = $nearby;
+}
+
+=head2 ajax
 
 Handle the ajax calls that the map makes when it is dragged. The info returned
 is used to update the pins on the map and the text descriptions on the side of
-the map.
+the map. Used via /around?ajax=1 but also available at /ajax for mobile app.
 
 =cut
 
 sub ajax : Path('/ajax') {
     my ( $self, $c ) = @_;
 
-    $c->res->content_type('application/json; charset=utf-8');
-
-    unless ( $c->req->param('bbox') ) {
+    my $ret = $c->forward('/location/determine_location_from_bbox');
+    unless ($ret) {
         $c->res->status(404);
         $c->res->body('');
         return;
     }
 
-    # assume this is not cacheable - may need to be more fine-grained later
-    $c->res->header( 'Cache_Control' => 'max-age=0' );
+    my %valid_categories = map { $_ => 1 } $c->get_param_list('filter_category', 1);
+    $c->stash->{filter_category} = \%valid_categories;
+    $c->cobrand->call_hook('munge_around_filter_category_list');
 
-    # how far back should we go?
-    my $all_pins = $c->req->param('all_pins') ? 1 : undef;
-    my $interval = $all_pins ? undef : $c->cobrand->on_map_default_max_pin_age;
-
-    # Need to be the class that can handle it
-    FixMyStreet::Map::set_map_class( 'OSM' );
-
-    # extract the data from the map
-    my ( $pins, $on_map, $around_map, $dist ) =
-      FixMyStreet::Map::map_pins( $c, $interval );
-
-    # render templates to get the html
-    my $on_map_list_html = $c->render_fragment(
-        'around/on_map_list_items.html',
-        { on_map => $on_map }
-    );
-    my $around_map_list_html = $c->render_fragment(
-        'around/around_map_list_items.html',
-        { around_map => $around_map, dist => $dist }
-    );
-
-    # JSON encode the response
-    my $body = JSON->new->utf8(1)->encode(
-        {
-            pins         => $pins,
-            current      => $on_map_list_html,
-            current_near => $around_map_list_html,
-        }
-    );
-
-    $c->res->body($body);
+    $c->forward('map_features', [ { bbox => $c->stash->{bbox} } ]);
+    $c->forward('/reports/ajax', [ 'around/on_map_list_items.html' ]);
 }
 
+sub nearby : Path {
+    my ($self, $c) = @_;
+
+    my $states = FixMyStreet::DB::Result::Problem->open_states();
+    my $params = {
+        latitude => $c->get_param('latitude'),
+        longitude => $c->get_param('longitude'),
+        categories => [ $c->get_param('filter_category') || () ],
+        states => $states,
+    };
+    $c->cobrand->call_hook('around_nearby_filter', $params);
+    $c->forward('/report/_nearby_json', [ $params ]);
+}
+
+sub location_closest_address : Path('/ajax/closest') {
+    my ( $self, $c ) = @_;
+    $c->res->content_type('application/json; charset=utf-8');
+
+    my $lat = $c->get_param('lat');
+    my $lon = $c->get_param('lon');
+    unless ($lat && $lon) {
+        $c->res->status(404);
+        $c->res->body('');
+        return;
+    }
+
+    my $closest = $c->cobrand->find_closest({ latitude => $lat, longitude => $lon });
+    my $data = {
+        road => $closest->{address}{addressLine},
+        full_address => $closest->{name},
+    };
+
+    $c->res->body(encode_json($data));
+}
 
 sub location_autocomplete : Path('/ajax/geocode') {
     my ( $self, $c ) = @_;
     $c->res->content_type('application/json; charset=utf-8');
-    unless ( $c->req->param('term') ) {
+    unless ( $c->get_param('term') ) {
         $c->res->status(404);
         $c->res->body('');
         return;
@@ -293,37 +375,38 @@ sub location_autocomplete : Path('/ajax/geocode') {
     # we want the match even if there's no ambiguity, so recommendation doesn't
     # disappear when it's the last choice being offered in the autocomplete.
     $c->stash->{allow_single_geocode_match_strings} = 1;
-    return $self->_geocode( $c, $c->req->param('term') );
+    return $self->_geocode( $c, $c->get_param('term') );
 }
 
 sub location_lookup : Path('/ajax/lookup_location') {
     my ( $self, $c ) = @_;
     $c->res->content_type('application/json; charset=utf-8');
-    unless ( $c->req->param('term') ) {
+    unless ( $c->get_param('term') ) {
         $c->res->status(404);
         $c->res->body('');
         return;
     }
 
-    return $self->_geocode( $c, $c->req->param('term') );
+    return $self->_geocode( $c, $c->get_param('term') );
 }
 
 sub _geocode : Private {
     my ( $self, $c, $term ) = @_;
 
     my ( $lat, $long, $suggestions ) =
-        FixMyStreet::Geocode::lookup( $c->req->param('term'), $c );
+        FixMyStreet::Geocode::lookup( $c->get_param('term'), $c );
 
-    my ($response, @addresses);
+    my ($response, @addresses, @locations);
 
     if ( $lat && $long ) {
         $response = { latitude => $lat, longitude => $long };
     } else {
         if ( ref($suggestions) eq 'ARRAY' ) {
             foreach (@$suggestions) {
-                push @addresses, decode_utf8($_->{address});
+                push @addresses, $_->{address};
+                push @locations, { address => $_->{address}, lat => $_->{latitude}, long => $_->{longitude} };
             }
-            $response = { suggestions => \@addresses };
+            $response = { suggestions => \@addresses, locations => \@locations };
         } else {
             $response = { error => $suggestions };
         }
@@ -333,11 +416,34 @@ sub _geocode : Private {
         $response = \@addresses;
     }
 
-    my $body = JSON->new->utf8(1)->encode(
-        $response
-    );
+    my $body = encode_json($response);
     $c->res->body($body);
 
+}
+
+sub lookup_by_ref : Private {
+    my ( $self, $c, $ref ) = @_;
+
+    my $criteria = $c->cobrand->call_hook("lookup_by_ref", $ref) ||
+        [
+            id => $ref,
+            external_id => $ref
+        ];
+
+    my $problems = $c->cobrand->problems->search({ non_public => 0, -or => $criteria });
+
+    my $count = try {
+        $problems->count;
+    } catch {
+        0;
+    };
+
+    if ($count > 1) {
+        $c->stash->{ref} = $ref;
+        $c->stash->{matching_reports} = [ $problems->all ];
+    } elsif ($count == 1) {
+        $c->res->redirect( $c->uri_for( '/report', $problems->first->id ) );
+    }
 }
 
 __PACKAGE__->meta->make_immutable;
